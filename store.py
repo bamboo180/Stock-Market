@@ -15,6 +15,7 @@ import os
 import requests
 
 DEFAULT = ["2330", "0050", "AAPL", "NVDA"]
+DEFAULT_INDICES = ["^TWII", "^TWOII", "^GSPC", "^IXIC", "^DJI", "^SOX"]
 LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json")
 
 
@@ -28,7 +29,9 @@ def _normalize(data) -> dict:
         data = {"favorites": data}
     data = data if isinstance(data, dict) else {}
     pos = data.get("positions") or {}
+    idx = data.get("indices")
     return {"favorites": _clean(data.get("favorites", DEFAULT)),
+            "indices": _clean(DEFAULT_INDICES if idx is None else idx),
             "positions": {str(k).upper(): v for k, v in pos.items() if isinstance(v, dict) and v.get("cost")}}
 
 

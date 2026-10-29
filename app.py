@@ -13,6 +13,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import engine
+import indices
 import kchart
 import live
 import news
@@ -36,6 +37,9 @@ st.markdown("""
 .live{border:1px solid rgba(128,128,128,.3);border-radius:10px;padding:10px 14px;margin:4px 0 10px}
 .live .row{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline}
 .live .px{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums}
+[data-testid="InputInstructions"]{display:none!important}
+.st-key-idx [data-testid="stMetricValue"]{font-size:1.45rem}
+.st-key-idx [data-testid="stMetricLabel"] p{font-size:.85rem}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
 </style>
 """, unsafe_allow_html=True)
@@ -67,7 +71,7 @@ if APP_PASSWORD and not st.session_state.get("authed"):
 SAVED_TOKEN = secret("FINMIND_TOKEN")
 PERIODS = {"1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825}
 LIVE_EVERY = 60          # 盤中即時報價更新秒數
-VIEWS = ["⭐ 我的最愛", "🔍 個股分析"]
+VIEWS = ["📈 市場總覽", "🔍 個股分析"]
 
 
 def market_of(code: str) -> str:
@@ -118,15 +122,17 @@ if "favs" not in st.session_state:
     try:
         _data = fav_store.load()
     except store.StoreError as e:
-        _data = {"favorites": list(store.DEFAULT), "positions": {}}
+        _data = {"favorites": list(store.DEFAULT), "positions": {}, "indices": list(store.DEFAULT_INDICES)}
         st.session_state.store_err = str(e)
     st.session_state.favs = _data["favorites"]
     st.session_state.positions = _data["positions"]
+    st.session_state.indices = _data.get("indices", list(store.DEFAULT_INDICES))
 
 
 def save_favs():
     try:
-        fav_store.save({"favorites": st.session_state.favs, "positions": st.session_state.positions})
+        fav_store.save({"favorites": st.session_state.favs, "positions": st.session_state.positions,
+                        "indices": st.session_state.indices})
         st.session_state.pop("store_err", None)
     except store.StoreError as e:
         st.session_state.store_err = str(e) + "（這次的變更只在目前畫面有效）"
@@ -260,9 +266,60 @@ def fmt_chg(x):
 # 頁面一：我的最愛總覽
 # ============================================================================
 if st.session_state.nav == VIEWS[0]:
-    st.title("⭐ 我的最愛")
+    st.title("📈 市場總覽")
     st.caption(f"台股 {live.status_text('TW')}｜美股 {live.status_text('US')}")
 
+    # ---------- 市場指數 ----------
+    @st.cache_data(ttl=60, show_spinner=False)
+    def get_indices(syms: tuple):
+        return indices.fetch(list(syms))
+
+    def on_indices_change():
+        chosen = []
+        for x in st.session_state.idx_pick or []:
+            sym = str(x).split("｜")[0].strip().upper()
+            if sym and sym not in chosen:
+                chosen.append(sym)
+        st.session_state.indices = chosen
+        save_favs()
+
+    @st.fragment(run_every=LIVE_EVERY if any_open else None)
+    def index_board():
+        syms = list(st.session_state.indices)
+        if not syms:
+            st.caption("還沒有選指數，展開下方「調整指數」加入。")
+            return
+        data = get_indices(tuple(syms))
+        per_row = 6
+        for i in range(0, len(syms), per_row):
+            cols = st.columns(per_row)
+            for col, sym in zip(cols, syms[i:i + per_row]):
+                d = data.get(sym)
+                with col:
+                    if not d:
+                        st.metric(indices.name_of(sym), "—", "取不到資料", delta_color="off", border=True)
+                        continue
+                    v = d["price"]
+                    st.metric(indices.name_of(sym), f"{v:,.0f}" if v >= 10000 else f"{v:,.2f}",
+                              None if d["chg"] is None else f"{d['chg'] * 100:+.2f}%",
+                              delta_color="inverse" if indices.is_tw(sym) else "normal",
+                              chart_data=d["spark"] or None, chart_type="area", border=True,
+                              help=f"{sym}｜{d['source']} {d['time']}")
+
+    st.markdown("#### 📊 市場指數")
+    with st.container(key="idx"):
+        index_board()
+    with st.expander("調整指數"):
+        labels = {k: f"{k}｜{v[0]}" for k, v in indices.CATALOG.items()}
+        current = [labels.get(x, x) for x in st.session_state.indices]
+        options = list(dict.fromkeys(current + list(labels.values())))
+        st.multiselect("顯示的指數（拖不動順序：先移除再加入，新的會排在最後）", options, default=current,
+                       key="idx_pick", on_change=on_indices_change, accept_new_options=True,
+                       placeholder="選擇或輸入 Yahoo 代號，例如 ^FTSE")
+        st.caption("清單外的指數可以直接輸入 Yahoo Finance 代號後按 Enter，例如 ^FTSE（英國）、^BSESN（印度）、^AXJO（澳洲）。"
+                   "台股指數紅漲綠跌，其他市場綠漲紅跌。")
+
+    st.markdown("#### ⭐ 我的最愛")
     favs = list(st.session_state.favs)
     if not favs:
         st.info("清單是空的。在下方輸入代號加入，或到個股頁按「☆ 加入最愛」。")
@@ -278,7 +335,7 @@ if st.session_state.nav == VIEWS[0]:
             if len(favs) > 1:
                 prog.caption(f"分析中 {i + 1}/{len(favs)}：{c}")
             row = {"代號": c, "名稱": "", "市場": "台股" if market_of(c) == "TW" else "美股",
-                   "現價": None, "漲跌": "—", "評分": None, "判讀": "", "10日區間": "", "停損參考": None, "成本": np.nan, "持倉損益": "", "狀態": ""}
+                   "現價": None, "漲跌": "—", "評分": None, "判讀": "", "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
                 market, name, r = analyze(c, 730, token)
                 row.update({"名稱": name, "評分": r["score"], "判讀": r["verdict"],
@@ -293,7 +350,7 @@ if st.session_state.nav == VIEWS[0]:
                 pos = st.session_state.positions.get(c)
                 if pos:
                     pp = pos_analyze(r["df"], r, row["現價"], pos)
-                    row.update({"成本": pos["cost"], "持倉損益": fmt_chg(pp["pnl"]), "停損參考": round(pp["stop"], 2)})
+                    row.update({"成本": f"{pos['cost']:,.2f}", "持倉損益": fmt_chg(pp["pnl"]), "停損參考": round(pp["stop"], 2)})
                     if pp["triggered"]:
                         row["狀態"] += "｜⚠ 跌破我的停損"
                 elif qq and qq["price"] < r["stop"]:
@@ -332,7 +389,6 @@ if st.session_state.nav == VIEWS[0]:
                      key="fav_table", on_select=on_table_select, selection_mode="single-row",
                      column_config={"現價": st.column_config.NumberColumn(format="%.2f"),
                                     "停損參考": st.column_config.NumberColumn(format="%.2f"),
-                                    "成本": st.column_config.NumberColumn(format="%.2f"),
                                     "評分": st.column_config.NumberColumn(format="%+d")})
         st.caption("點選任一列左側的方框即可開啟該股分析。"
                    + (f" 盤中每 {LIVE_EVERY} 秒自動更新報價。" if any_open else ""))

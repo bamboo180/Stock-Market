@@ -49,13 +49,12 @@ def _num(x) -> float | None:
         return None
 
 
-def quotes_tw(codes: list[str]) -> dict[str, dict]:
-    """一次查多檔台股。每檔同時查上市(tse)與上櫃(otc)，哪個有資料用哪個。"""
-    if not codes:
+def quotes_mis(ex_ch: list[str]) -> dict[str, dict]:
+    """查證交所基本市況報導站。ex_ch 例如 ["tse_2330.tw", "otc_o00.tw"]，回傳以代號為 key。"""
+    if not ex_ch:
         return {}
-    ex_ch = "|".join(f"{ex}_{c}.tw" for c in codes for ex in ("tse", "otc"))
     try:
-        r = requests.get(MIS, params={"ex_ch": ex_ch, "json": 1, "delay": 0}, timeout=10,
+        r = requests.get(MIS, params={"ex_ch": "|".join(ex_ch), "json": 1, "delay": 0}, timeout=10,
                          headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"})
         rows = r.json().get("msgArray", [])
     except Exception:
@@ -82,6 +81,11 @@ def quotes_tw(codes: list[str]) -> dict[str, dict]:
             "name": m.get("n", ""), "source": "證交所",
         }
     return out
+
+
+def quotes_tw(codes: list[str]) -> dict[str, dict]:
+    """一次查多檔台股。每檔同時查上市(tse)與上櫃(otc)，哪個有資料用哪個。"""
+    return quotes_mis([f"{ex}_{c}.tw" for c in codes for ex in ("tse", "otc")])
 
 
 def quote_us(ticker: str) -> dict | None:
