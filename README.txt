@@ -16,10 +16,18 @@ Windows：雙擊「啟動.bat」，瀏覽器會自動打開 http://localhost:850
    美股：AAPL、NVDA、TSLA、QQQ、BRK-B（英文代號）
 2. 或點左側「我的最愛」按鈕；個股頁右上角「☆ 加入最愛」可收藏
 3. 分頁：K 線與預估／籌碼‧量能／回測驗證／說明
+4. K 線操作：拖曳平移、滾輪（手機雙指）縮放、上方按鈕切換 1月/3月/6月/1年/全部，
+   游標移到 K 棒上方顯示開高低收與均線；雙擊右側價格軸復原
+5. 右側「重點消息」：近 7 天新聞，台股另含官方重大訊息；「只看重點」只留財報、營收、
+   法說、股利、評等、籌碼、營運、風險相關的標題
 
 【檔案】
 app.py        介面
 engine.py     抓資料、評分、模型、回測、預估扇形
+kchart.py     互動 K 線圖（TradingView Lightweight Charts）
+news.py       新聞抓取與重點標記
+live.py       即時報價與交易時段
+store.py      我的最愛儲存
 requirements.txt  需要的套件
 
 【資料來源與限制】
@@ -67,3 +75,10 @@ requirements.txt  需要的套件
      GITHUB_REPO = "你的GitHub帳號/stock-signal-app"
 5. 側邊欄底部會顯示「最愛儲存於：GitHub」
 最愛會存在 repo 的 favorites-data 分支，不會影響程式碼，也不會觸發重新部署。
+
+【AI 新聞摘要（選用，需付費）】
+在 secrets.toml（雲端則是 Secrets）加上 Anthropic API key：
+  ANTHROPIC_API_KEY = "sk-ant-..."
+新聞欄就會出現「✨ AI 整理重點」按鈕，由 Claude 把近一週標題整理成 3～5 點利多／利空重點。
+只有按按鈕才會呼叫，結果快取 1 小時。API 依用量計費，到 console.anthropic.com 申請。
+沒設定也沒關係，新聞列表和重點標記照常可用。

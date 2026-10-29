@@ -12,7 +12,9 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import engine
+import kchart
 import live
+import news
 import store
 
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
@@ -391,18 +393,81 @@ st.markdown(chips, unsafe_allow_html=True)
 st.markdown("#### AI 解讀")
 st.markdown(f"<div class='ai'>{r['explain']}</div>", unsafe_allow_html=True)
 
-# --- 圖表分頁 ---
-tab_k, tab_chip, tab_bt, tab_about = st.tabs(["K 線與預估", "籌碼 / 量能", "回測驗證", "說明"])
+# --- 圖表（左）＋ 新聞（右） ---
+PLOTLY_CFG = {"scrollZoom": True, "displaylogo": False,
+              "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]}
+
+
+def embed_html(html: str, height: int):
+    """新版 Streamlit 用 st.iframe；舊版退回 components.html。"""
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+    else:
+        import streamlit.components.v1 as components
+        components.html(html, height=height)
+
+
+def is_dark() -> bool:
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_news(code: str, market: str, name: str):
+    return news.fetch(code, market, name)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_ai_summary(key: str, label: str, titles: tuple):
+    items = [news.Item(title=t, source=s, time=pd.Timestamp(tm).to_pydatetime()) for t, s, tm in titles]
+    return news.ai_summary(key, label, items)
+
+
+main, side = st.columns([2.4, 1], gap="medium")
+
+with side:
+    st.markdown("#### 📰 重點消息")
+    with st.spinner("抓取新聞中…"):
+        items = get_news(code, market, name)
+    only_key = st.toggle("只看重點", value=True, help="財報、營收、法說、股利、評等、籌碼、營運、風險相關，以及官方重大訊息")
+    shown = [i for i in items if i["kind"] == "official" or i["tags"]] if only_key else items
+    ai_key = secret("ANTHROPIC_API_KEY")
+    if ai_key and items:
+        if st.button("✨ AI 整理重點", width="stretch"):
+            st.session_state[f"ai_{code}"] = True
+        if st.session_state.get(f"ai_{code}"):
+            try:
+                with st.spinner("Claude 整理中…"):
+                    txt = get_ai_summary(ai_key, f"{code} {name}".strip(),
+                                         tuple((i["title"], i["source"], i["time"].isoformat()) for i in items[:30]))
+                st.info(txt)
+            except Exception as e:
+                st.warning(f"AI 摘要失敗：{e}")
+    box = st.container(height=640, border=False)
+    with box:
+        if not shown:
+            st.caption("近 7 天沒有找到相關新聞。" if not items else "沒有標記為重點的新聞，關掉「只看重點」可看全部。")
+        tone_col = {"pos": up_c, "neg": down_c, "": "inherit"}
+        for it in shown:
+            tags = "".join(f"<span class='chip' style='font-size:.72rem;padding:0 6px'>{t}</span>" for t in it["tags"])
+            if it["kind"] == "official":
+                tags = "<span class='chip' style='font-size:.72rem;padding:0 6px;color:#b7791f'>官方重訊</span>" + tags
+            arrow = {"pos": "▲ ", "neg": "▼ ", "": ""}[it["tone"]]
+            title = it["title"].replace("<", "&lt;")
+            st.markdown(
+                f"<div style='padding:8px 0;border-bottom:1px solid rgba(128,128,128,.18)'>"
+                f"<a href='{it['link']}' target='_blank' style='text-decoration:none;color:{tone_col[it['tone']]};"
+                f"font-weight:500;line-height:1.5'>{arrow}{title}</a>"
+                f"<div class='small'>{it['time']:%m/%d %H:%M}・{it['source']}</div><div>{tags}</div></div>",
+                unsafe_allow_html=True)
+    st.caption("▲▼ 依標題關鍵字粗略判斷，僅供快速瀏覽。點標題開原文。")
+
+tab_k, tab_chip, tab_bt, tab_about = main.tabs(["K 線與預估", "籌碼 / 量能", "回測驗證", "說明"])
 
 with tab_k:
-    show = st.slider("顯示最近幾個交易日", 60, len(df), min(180, len(df)), step=10, key="k_range")
-    v = df.tail(show)
-    cone = r["cone"]
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22], vertical_spacing=0.03)
-    fig.add_trace(go.Candlestick(x=v["date"], open=v["open"], high=v["high"], low=v["low"], close=v["close"],
-                                 increasing_line_color=up_c, increasing_fillcolor=up_c,
-                                 decreasing_line_color=down_c, decreasing_fillcolor=down_c, name="K 線"), 1, 1)
-    # 今日盤中暫定 K 棒（歷史資料還沒有今天時才畫）
+    today = None
     q = get_quotes((code,)).get(code)
     if q and q.get("open") and q.get("high") and q.get("low"):
         try:
@@ -410,28 +475,14 @@ with tab_k:
         except ValueError:
             qd = None
         if qd is not None and qd > last["date"] and (market == "TW" or live.is_open(market)):
-            fig.add_trace(go.Candlestick(x=[qd], open=[q["open"]], high=[q["high"]], low=[q["low"]], close=[q["price"]],
-                                         increasing_line_color=up_c, decreasing_line_color=down_c,
-                                         increasing_fillcolor="rgba(0,0,0,0)", decreasing_fillcolor="rgba(0,0,0,0)",
-                                         name="今日盤中（暫定）"), 1, 1)
-    fig.add_trace(go.Scatter(x=v["date"], y=v["ma20"], name="月線 MA20", line=dict(color="#b7791f", width=1.3)), 1, 1)
-    fig.add_trace(go.Scatter(x=v["date"], y=v["ma60"], name="季線 MA60", line=dict(color="#8a8d95", width=1.3)), 1, 1)
-    x0 = [last["date"]]
-    y0 = [r["close"]]
-    fig.add_trace(go.Scatter(x=x0 + list(cone["date"]), y=y0 + list(cone["p90"]), line=dict(color="#2f5bd3", width=1, dash="dot"),
-                             name="P90 樂觀", showlegend=False), 1, 1)
-    fig.add_trace(go.Scatter(x=x0 + list(cone["date"]), y=y0 + list(cone["p10"]), line=dict(color="#2f5bd3", width=1, dash="dot"),
-                             fill="tonexty", fillcolor="rgba(47,91,211,.15)", name="80% 機率區間"), 1, 1)
-    fig.add_trace(go.Scatter(x=x0 + list(cone["date"]), y=y0 + list(cone["p50"]), line=dict(color="#2f5bd3", width=2),
-                             name="預估中位數"), 1, 1)
-    vcol = np.where(v["close"] >= v["open"], up_c, down_c)
-    fig.add_trace(go.Bar(x=v["date"], y=v["vol"], marker_color=vcol, opacity=0.5, name="成交量", showlegend=False), 2, 1)
-    fig.update_layout(height=620, margin=dict(l=10, r=10, t=10, b=10), xaxis_rangeslider_visible=False,
-                      legend=dict(orientation="h", y=1.02, x=0), hovermode="x unified")
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    st.plotly_chart(fig, width="stretch")
-    st.caption("藍色區域是未來 20 個交易日的 80% 機率區間（依近 60 日波動度估計），不是一條預言的走勢。"
-               "空心 K 棒是今天盤中暫定值，收盤後資料更新才會納入評分。")
+            today = {"date": qd.strftime("%Y-%m-%d"), "open": q["open"], "high": q["high"],
+                     "low": q["low"], "close": q["price"]}
+    embed_html(kchart.build(df, r["cone"], up_c, down_c, r["stop"], today=today, dark=is_dark(),
+                                 vol_unit="張" if market == "TW" else "股"), height=600)
+    st.caption("藍色帶狀是未來 20 個交易日的 80% 機率區間（依近 60 日波動度估計），不是預言的走勢；"
+               "虛線是停損參考；空心 K 棒是今天盤中暫定值，收盤資料更新後才納入評分。")
+
+show = len(df)
 
 with tab_chip:
     ch = r["chips"].tail(show)
@@ -460,12 +511,14 @@ with tab_chip:
                            secondary_y=(s == "OBV 能量潮"))
         fig3 = None
     fig2.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.08),
-                       hovermode="x unified")
-    st.plotly_chart(fig2, width="stretch")
+                       hovermode="x unified", dragmode="pan")
+    st.plotly_chart(fig2, width="stretch", config=PLOTLY_CFG)
     if fig3 is not None:
-        st.plotly_chart(fig3, width="stretch")
+        fig3.update_layout(dragmode="pan")
+        st.plotly_chart(fig3, width="stretch", config=PLOTLY_CFG)
 
 with tab_bt:
+    st.caption("拖曳平移、滾輪縮放、雙擊復原。")
     bt = r["bt"]
     st.markdown(f"期間 {bt['start']} ~ {r['asof']}。規則：評分 ≥ {bt['hi_th']} 隔日開盤買進，"
                 f"≤ {bt['lo_th']} 隔日開盤賣出，已扣手續費{'與證交稅' if market == 'TW' else ''}。共 {bt['trades']} 次進出。")
@@ -474,8 +527,8 @@ with tab_bt:
     fig4.add_trace(go.Scatter(x=eq["date"], y=(eq["策略"] - 1) * 100, name="評分策略", line=dict(color="#2f5bd3", width=2)))
     fig4.add_trace(go.Scatter(x=eq["date"], y=(eq["買進持有"] - 1) * 100, name="買進持有", line=dict(color="#8a8d95", width=2)))
     fig4.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="累積報酬（%）",
-                       legend=dict(orientation="h", y=1.08), hovermode="x unified")
-    st.plotly_chart(fig4, width="stretch")
+                       legend=dict(orientation="h", y=1.08), hovermode="x unified", dragmode="pan")
+    st.plotly_chart(fig4, width="stretch", config=PLOTLY_CFG)
 
     a, b = st.columns(2)
     with a:
