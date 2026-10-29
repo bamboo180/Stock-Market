@@ -23,6 +23,7 @@ FINMIND = "https://api.finmindtrade.com/api/v4/data"
 COSTS = {
     "TW": {"buy": 0.001425, "sell": 0.001425 + 0.003},   # 手續費 + 證交稅
     "US": {"buy": 0.0005, "sell": 0.0005},               # 假設 0.05% 滑價/手續費
+    "IDX": {"buy": 0.0005, "sell": 0.0005},              # 指數（以 ETF 追蹤的成本估計）
 }
 
 
@@ -33,8 +34,16 @@ class DataError(Exception):
 # ----------------------------------------------------------------------------
 # 市場判斷
 # ----------------------------------------------------------------------------
+def is_index(code: str) -> bool:
+    """指數、期貨、匯率、加密幣等 Yahoo 代號：^TWII、ES=F、TWD=X、BTC-USD、000001.SS"""
+    c = code.strip().upper()
+    return c.startswith("^") or "=" in c or c.endswith("-USD") or bool(re.fullmatch(r"\d{6}\.(SS|SZ)", c)) or c == "DX-Y.NYB"
+
+
 def detect_market(code: str) -> str:
     code = code.strip().upper()
+    if is_index(code):
+        return "IDX"
     if re.fullmatch(r"\d{4,6}[A-Z]?", code):
         return "TW"
     if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", code):
@@ -148,6 +157,14 @@ def _yf(ticker: str, start: str) -> pd.DataFrame:
     }).dropna()
 
 
+def fetch_index(symbol: str, start: str) -> pd.DataFrame:
+    df = _yf(symbol, start)
+    if df.empty:
+        raise DataError(f"找不到指數 {symbol} 的資料，請確認是 Yahoo Finance 的代號（例如 ^TWII、^GSPC）。")
+    df["bench"] = np.nan
+    return df
+
+
 def fetch_us(ticker: str, start: str) -> pd.DataFrame:
     df = _yf(ticker, start)
     if df.empty:
@@ -178,7 +195,7 @@ NEG_LABEL = {
     "價格站上月線": "價格跌破月線", "月線在季線之上": "月線在季線之下",
     "外資10日買超": "外資10日賣超", "投信10日買超": "投信10日賣超",
     "融資10日減少": "融資10日增加", "OBV 10日上升": "OBV 10日下降",
-    "RSI 高於 50": "RSI 低於 50", "20日強於大盤": "20日弱於大盤",
+    "RSI 高於 50": "RSI 低於 50", "20日強於大盤": "20日弱於大盤", "20日漲幅為正": "20日漲幅為負",
 }
 
 
@@ -208,8 +225,10 @@ def analyze(df: pd.DataFrame, market: str) -> dict:
     feat = {
         "ret5": c.pct_change(5), "ret20": c.pct_change(20),
         "dist_ma20": c / df["ma20"] - 1, "ma20_ma60": df["ma20"] / df["ma60"] - 1,
-        "rsi": df["rsi"], "vol_ratio": df["vol"] / df["vol"].rolling(20).mean(),
+        "rsi": df["rsi"],
     }
+    if df["vol"].fillna(0).sum() > 0:
+        feat["vol_ratio"] = df["vol"] / df["vol"].rolling(20).mean()
 
     parts: dict[str, pd.Series] = {
         "價格站上月線": _sign(c > df["ma20"]),
@@ -233,6 +252,11 @@ def analyze(df: pd.DataFrame, market: str) -> dict:
                        "投信累計（張）": df["trust"].cumsum()}
         if has_margin:
             chip_series["融資餘額（張）"] = df["margin"]
+    elif market == "IDX":
+        # 指數：沒有法人資料，很多也沒有成交量，只看趨勢與動能
+        parts["RSI 高於 50"] = _sign(df["rsi"] > 50)
+        parts["20日漲幅為正"] = _sign(c.pct_change(20) > 0)
+        chip_series = {"RSI(14)": df["rsi"]}
     else:
         # 美股沒有每日法人資料：改用量能與相對強弱
         df["obv"] = (np.sign(c.diff()).fillna(0) * df["vol"]).cumsum()
@@ -388,6 +412,7 @@ def explain(r: dict) -> str:
         s.append("正面因素：" + "、".join(pos) + "。")
     if neg:
         s.append("負面因素：" + "、".join(neg) + "。")
+    c20 = r["df"]["close"].iloc[-1] / r["df"]["close"].iloc[-21] - 1 if len(r["df"]) > 21 else 0
     if market == "TW":
         f10, t10 = last.get("f10", np.nan), last.get("t10", np.nan)
         if pd.notna(f10):
@@ -396,6 +421,8 @@ def explain(r: dict) -> str:
         if pd.notna(mc):
             s.append(f"融資 10 日{'增加' if mc > 0 else '減少'} {abs(mc) * 100:.1f}%"
                      + ("，散戶追價，籌碼偏不安定。" if mc > 0.05 else "，籌碼相對安定。" if mc < 0 else "。"))
+    elif market == "IDX":
+        s.append(f"RSI 為 {last['rsi']:.0f}，近 20 日{'上漲' if c20 > 0 else '下跌'} {abs(c20) * 100:.1f}%。")
     else:
         rs = last.get("rs20", np.nan)
         if pd.notna(rs):

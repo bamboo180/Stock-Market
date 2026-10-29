@@ -13,6 +13,12 @@ import requests
 TZ = {"TW": ZoneInfo("Asia/Taipei"), "US": ZoneInfo("America/New_York")}
 SESSION = {"TW": (dt.time(9, 0), dt.time(13, 30)), "US": (dt.time(9, 30), dt.time(16, 0))}
 MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+MIS_INDEX = {"^TWII": "tse_t00.tw", "^TWOII": "otc_o00.tw"}      # 台股指數的證交所即時代碼
+
+
+def session_of(code: str, market: str) -> str:
+    """決定用哪個市場的交易時段：台股、台股指數用 TW，其他用 US。"""
+    return "TW" if market == "TW" or code in MIS_INDEX else "US"
 
 
 # ----------------------------------------------------------------------------
@@ -117,8 +123,15 @@ def _safe(fi, attr):
 
 def quotes(codes: list[str], market_of) -> dict[str, dict]:
     tw = [c for c in codes if market_of(c) == "TW"]
-    us = [c for c in codes if market_of(c) == "US"]
+    tw_idx = [c for c in codes if c in MIS_INDEX]
+    us = [c for c in codes if market_of(c) in ("US", "IDX") and c not in MIS_INDEX]
     out = quotes_tw(tw)
+    if tw_idx:
+        q = quotes_mis([MIS_INDEX[c] for c in tw_idx])
+        for c in tw_idx:
+            k = MIS_INDEX[c].split("_")[1].split(".")[0]
+            if k in q:
+                out[c] = q[k]
     for c in us:
         q = quote_us(c)
         if q:

@@ -18,6 +18,7 @@ import kchart
 import live
 import news
 import position
+import recap
 import store
 import symbols
 
@@ -25,7 +26,7 @@ st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wi
 
 st.markdown("""
 <style>
-.block-container{padding-top:1.4rem;max-width:1200px}
+.block-container{padding-top:3.6rem;max-width:1200px}
 .verdict{font-size:1.5rem;font-weight:700;margin:0}
 .chip{display:inline-block;margin:2px 4px 2px 0;padding:2px 10px;border-radius:6px;font-size:.85rem;
       border:1px solid rgba(128,128,128,.35)}
@@ -71,7 +72,8 @@ if APP_PASSWORD and not st.session_state.get("authed"):
 SAVED_TOKEN = secret("FINMIND_TOKEN")
 PERIODS = {"1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825}
 LIVE_EVERY = 60          # 盤中即時報價更新秒數
-VIEWS = ["📈 市場總覽", "🔍 個股分析"]
+VIEWS = ["📈 市場總覽", "📰 盤後整理", "🔍 個股分析"]
+HOME, RECAP, STOCK = VIEWS
 
 
 def market_of(code: str) -> str:
@@ -81,10 +83,10 @@ def market_of(code: str) -> str:
         return "?"
 
 
-def colors(market: str) -> tuple[str, str]:
-    """台股紅漲綠跌，美股綠漲紅跌。"""
+def colors(market: str, code: str = "") -> tuple[str, str]:
+    """台股（含台股指數）紅漲綠跌，其他綠漲紅跌。"""
     red, green = "#d1352b", "#14825a"
-    return (red, green) if market == "TW" else (green, red)
+    return (red, green) if market == "TW" or code in live.MIS_INDEX else (green, red)
 
 
 # ----------------------------------------------------------------------------
@@ -97,6 +99,9 @@ def load(code: str, days: int, token: str | None):
     if market == "TW":
         df = engine.fetch_tw(code, start, token or None)
         name = engine.tw_name(code, token or None)
+    elif market == "IDX":
+        df = engine.fetch_index(code, start)
+        name = indices.name_of(code) if indices.name_of(code) != code else ""
     else:
         df = engine.fetch_us(code, start)
         name = engine.us_name(code)
@@ -151,7 +156,12 @@ def toggle_fav(code: str):
 
 def open_stock(code: str):
     st.session_state.code = code
-    st.session_state.nav = VIEWS[1]
+    st.session_state.nav = STOCK
+    st.session_state.jump = True      # 從 fragment 裡的按鈕觸發時，需要整頁重跑才會換頁
+
+
+def go_home():
+    st.session_state.nav = HOME
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -217,7 +227,7 @@ def on_table_select():
 if "code" not in st.session_state:
     st.session_state.code = (st.session_state.favs or ["2330"])[0]
 if "nav" not in st.session_state:
-    st.session_state.nav = VIEWS[0]
+    st.session_state.nav = HOME
 
 with st.sidebar:
     st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed")
@@ -229,22 +239,21 @@ with st.sidebar:
         cols = st.columns(2)
         for i, f in enumerate(st.session_state.favs):
             cols[i % 2].button(f, key=f"fav_{f}", width="stretch", on_click=open_stock, args=(f,),
-                               type="primary" if f == st.session_state.code and st.session_state.nav == VIEWS[1] else "secondary")
+                               type="primary" if f == st.session_state.code and st.session_state.nav == STOCK else "secondary")
     else:
         st.caption("還沒有收藏。到個股頁按「☆ 加入最愛」。")
 
     st.divider()
-    if SAVED_TOKEN:
-        st.caption("FinMind token：已從設定檔載入 ✓")
-        token = SAVED_TOKEN
-    else:
-        token = st.text_input("FinMind token（選填）", type="password",
-                              help="不填也能用，但每小時次數有限。可寫進 .streamlit/secrets.toml 就不用每次貼。")
+    token = SAVED_TOKEN          # FinMind token 從 .streamlit/secrets.toml 讀取
     if st.button("清除快取並重新抓取", width="stretch"):
-        load.clear(); analyze.clear(); get_quotes.clear()
+        st.cache_data.clear()
         st.rerun()
     st.caption(f"最愛儲存於：{fav_store.label}")
     st.caption("歷史資料每 30 分鐘更新；開盤時報價每 60 秒自動更新。")
+
+st.session_state.pop("jump", None)
+if st.session_state.nav != HOME:
+    st.button("🏠 回首頁", on_click=go_home, type="tertiary")
 
 if st.session_state.get("store_err"):
     st.warning(st.session_state.store_err)
@@ -265,7 +274,7 @@ def fmt_chg(x):
 # ============================================================================
 # 頁面一：我的最愛總覽
 # ============================================================================
-if st.session_state.nav == VIEWS[0]:
+if st.session_state.nav == HOME:
     st.title("📈 市場總覽")
     st.caption(f"台股 {live.status_text('TW')}｜美股 {live.status_text('US')}")
 
@@ -285,6 +294,8 @@ if st.session_state.nav == VIEWS[0]:
 
     @st.fragment(run_every=LIVE_EVERY if any_open else None)
     def index_board():
+        if st.session_state.pop("jump", False):
+            st.rerun(scope="app")
         syms = list(st.session_state.indices)
         if not syms:
             st.caption("還沒有選指數，展開下方「調整指數」加入。")
@@ -305,6 +316,8 @@ if st.session_state.nav == VIEWS[0]:
                               delta_color="inverse" if indices.is_tw(sym) else "normal",
                               chart_data=d["spark"] or None, chart_type="area", border=True,
                               help=f"{sym}｜{d['source']} {d['time']}")
+                    st.button("K 線與分析 ›", key=f"idx_open_{sym}", on_click=open_stock, args=(sym,),
+                              type="tertiary", width="stretch")
 
     st.markdown("#### 📊 市場指數")
     with st.container(key="idx"):
@@ -334,7 +347,7 @@ if st.session_state.nav == VIEWS[0]:
         for i, c in enumerate(favs):
             if len(favs) > 1:
                 prog.caption(f"分析中 {i + 1}/{len(favs)}：{c}")
-            row = {"代號": c, "名稱": "", "市場": "台股" if market_of(c) == "TW" else "美股",
+            row = {"代號": c, "名稱": "", "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
                    "現價": None, "漲跌": "—", "評分": None, "判讀": "", "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
                 market, name, r = analyze(c, 730, token)
@@ -346,7 +359,7 @@ if st.session_state.nav == VIEWS[0]:
                 if qq:
                     row.update({"現價": qq["price"], "漲跌": fmt_chg(qq["chg"]),
                                 "名稱": name or qq.get("name", ""),
-                                "狀態": f"即時 {qq['time']}" if live.is_open(market) else f"最新 {qq['time']}"})
+                                "狀態": f"即時 {qq['time']}" if live.is_open(live.session_of(c, market)) else f"最新 {qq['time']}"})
                 pos = st.session_state.positions.get(c)
                 if pos:
                     pp = pos_analyze(r["df"], r, row["現價"], pos)
@@ -366,7 +379,7 @@ if st.session_state.nav == VIEWS[0]:
         table = pd.DataFrame(rows)
 
         def color(row):
-            up, down = colors("TW" if row["市場"] == "台股" else "US")
+            up, down = colors("TW" if row["市場"] == "台股" else "US", row["代號"])
             styles = [""] * len(row)
             ch = row["漲跌"]
             pl = row["持倉損益"]
@@ -406,8 +419,223 @@ if st.session_state.nav == VIEWS[0]:
     st.stop()
 
 
+
 # ============================================================================
-# 頁面二：個股分析
+# 頁面二：盤後整理
+# ============================================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_groups(token: str):
+    return symbols.load_tw(token or None)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_tw_recap(token: str, favs: tuple):
+    return recap.tw(get_groups(token), token or None, list(favs))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_us_recap(favs: tuple):
+    return recap.us(list(favs))
+
+
+def pct_table(df: pd.DataFrame, key: str, tw_colors: bool, cols: dict, height: int | None = None):
+    """可點選的漲跌表，點一列開啟個股分析。"""
+    if df is None or df.empty:
+        st.caption("暫無資料")
+        return
+    show = df.rename(columns=cols)[list(cols.values())].reset_index(drop=True)
+    up, down = ("#d1352b", "#14825a") if tw_colors else ("#14825a", "#d1352b")
+    pct_col = cols.get("pct")
+
+    def style(col):
+        if col.name != pct_col:
+            return [""] * len(col)
+        return [f"color:{up}" if v > 0 else f"color:{down}" if v < 0 else "" for v in col]
+
+    fmt = {pct_col: lambda v: f"{v * 100:+.2f}%"} if pct_col else {}
+    if "成交金額(億)" in show:
+        show["成交金額(億)"] = show["成交金額(億)"] / 1e8
+        fmt["成交金額(億)"] = "{:,.1f}"
+    if "收盤" in show:
+        fmt["收盤"] = "{:,.2f}"
+
+    def on_pick(k=key, codes=list(df["code"])):
+        rows = st.session_state[k].selection.rows
+        if rows:
+            open_stock(codes[rows[0]])
+
+    st.dataframe(show.style.apply(style).format(fmt), hide_index=True, width="stretch", key=key,
+                 on_select=on_pick, selection_mode="single-row", **({"height": height} if height else {}))
+
+
+def bar_chart(names, values, tw_colors: bool, title: str, unit: str = "%", height: int = 360):
+    up, down = ("#d1352b", "#14825a") if tw_colors else ("#14825a", "#d1352b")
+    vals = [v * 100 for v in values] if unit == "%" else list(values)
+    fig = go.Figure(go.Bar(x=vals, y=list(names), orientation="h",
+                           marker_color=[up if v >= 0 else down for v in vals],
+                           text=[f"{v:+.2f}{unit}" if unit == "%" else f"{v:+,.1f}{unit}" for v in vals],
+                           textposition="auto", insidetextanchor="end", cliponaxis=False))
+    fig.update_layout(height=height, margin=dict(l=10, r=40, t=36, b=10), title=title,
+                      yaxis=dict(autorange="reversed"), xaxis=dict(zeroline=True), dragmode=False)
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+
+_METRIC_PARAMS = set(inspect.signature(st.metric).parameters)
+
+
+def metric(where, *a, **kw):
+    where.metric(*a, **{k: v for k, v in kw.items() if k in _METRIC_PARAMS})
+
+
+def ai_recap_button(label: str, lines: list[str], key: str):
+    ai_key = secret("ANTHROPIC_API_KEY")
+    if not ai_key:
+        return
+    if st.button("✨ 請 Claude 寫盤後評論", key=key):
+        try:
+            with st.spinner("Claude 撰寫中…"):
+                st.session_state[key + "_txt"] = news.ask_claude(ai_key, (
+                    f"以下是{label}的盤後數據重點，請用繁體中文寫一段 150 字內的盤後評論，"
+                    "說明今天盤勢的主軸與明天要留意的地方，不要編造數據以外的事實，不給個股買賣建議。\n\n" + "\n".join(lines)))
+        except Exception as e:
+            st.warning(f"AI 評論失敗：{e}")
+    if st.session_state.get(key + "_txt"):
+        st.info(st.session_state[key + "_txt"])
+
+
+if st.session_state.nav == RECAP:
+    st.title("📰 盤後整理")
+    favs_t = tuple(st.session_state.favs)
+    tab_tw, tab_us = st.tabs(["台股", "美股"])
+
+    with tab_tw:
+        try:
+            with st.spinner("整理台股盤後資料中…"):
+                tr = get_tw_recap(token, favs_t)
+        except Exception as e:
+            st.error(f"台股盤後資料取不到：{e}")
+            tr = None
+        if tr:
+            st.caption(f"交易日 {tr['date']}｜資料：證交所每日收盤行情、FinMind 三大法人與融資"
+                       + ("" if tr.get("has_otc") else "｜排行只含上市股票（上櫃資料尚未更新）"))
+            m = st.columns(3) + st.columns(3)
+            t = tr.get("taiex")
+            if t:
+                metric(m[0], "加權指數", f"{t['close']:,.2f}", f"{t['chg']:+,.2f}（{t['pct'] * 100:+.2f}%）",
+                       delta_color="inverse", border=True)
+            o = tr.get("otc")
+            if o:
+                metric(m[1], "櫃買指數", f"{o['close']:,.2f}", f"{o['chg']:+,.2f}（{o['pct'] * 100:+.2f}%）",
+                       delta_color="inverse", border=True)
+            if tr.get("turnover"):
+                metric(m[2], "成交金額", f"{tr['turnover'] / 1e8:,.0f} 億元", border=True)
+            if "up" in tr:
+                metric(m[3], "上漲／下跌家數", f"{tr['up']}／{tr['down']}", f"漲停 {tr['limit_up']}｜跌停 {tr['limit_down']}",
+                       delta_color="off", delta_arrow="off", border=True)
+            if tr.get("inst"):
+                i_ = tr["inst"]
+                metric(m[4], "三大法人", f"{'買' if i_['合計'] >= 0 else '賣'}超 {abs(i_['合計']):,.1f} 億",
+                       f"{i_['外資']:+,.1f} 億（外資）", delta_color="inverse", border=True)
+            if tr.get("margin"):
+                mg = tr["margin"]
+                metric(m[5], "融資餘額", f"{mg['balance']:,.0f} 億元", f"{mg['chg']:+,.1f} 億",
+                       delta_color="off", border=True)
+
+            st.markdown("##### 重點摘要")
+            st.markdown("\n".join(f"- {x}" for x in tr["summary"]))
+            ai_recap_button("台股", tr["summary"], "ai_tw")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                sec = tr.get("sectors")
+                if sec is not None and len(sec):
+                    pick = pd.concat([sec.head(8), sec.tail(8)]).drop_duplicates("group")
+                    bar_chart(pick["group"], pick["pct"], True, "類股漲跌（成交金額加權）", height=480)
+            with c2:
+                if tr.get("inst"):
+                    inst = {k: v for k, v in tr["inst"].items()}
+                    bar_chart(list(inst), list(inst.values()), True, "三大法人買賣超（億元）", unit=" 億", height=230)
+                if tr.get("sub_idx"):
+                    sub = pd.DataFrame(tr["sub_idx"])
+                    bar_chart(sub["name"], sub["pct"], True, "主要類股指數", height=240)
+
+            st.caption("點選表格任一列左側方框，可開啟該股分析。")
+            cols = {"code": "代號", "name": "名稱", "close": "收盤", "pct": "漲跌", "value": "成交金額(億)"}
+            a, b, c = st.columns(3)
+            with a:
+                st.markdown("##### 🔺 漲幅前 10")
+                pct_table(tr["gainers"], "tw_gain", True, cols)
+            with b:
+                st.markdown("##### 🔻 跌幅前 10")
+                pct_table(tr["losers"], "tw_lose", True, cols)
+            with c:
+                st.markdown("##### 💰 成交金額前 10")
+                pct_table(tr["top_value"], "tw_value", True, cols)
+            st.caption("漲跌幅排行不含 ETF，且只列成交金額 5,000 萬元以上的股票，避免冷門股干擾。")
+            if tr.get("favs") is not None and len(tr["favs"]):
+                st.markdown("##### ⭐ 我的最愛（台股）今日表現")
+                pct_table(tr["favs"], "tw_favs", True, cols)
+
+    with tab_us:
+        try:
+            with st.spinner("整理美股盤後資料中…"):
+                ur = get_us_recap(favs_t)
+        except Exception as e:
+            st.error(f"美股盤後資料取不到：{e}")
+            ur = None
+        if ur:
+            st.caption(f"交易日 {ur['date']}（美東時間）"
+                       + ("｜⚠ 美股盤中，數字尚未收盤" if live.is_open("US") else "") + "｜資料：Yahoo Finance")
+            idx = ur["indices"].reset_index(drop=True)
+            m = st.columns(4)
+            for i, row in idx.iterrows():
+                unit = "%" if row["code"] == "^TNX" else ""
+                m[i % 4].metric(row["name"], f"{row['close']:,.2f}{unit}", f"{row['pct'] * 100:+.2f}%",
+                                delta_color="inverse" if row["code"] == "^VIX" else "normal", border=True)
+            if ur.get("adr"):
+                ad = ur["adr"]
+                metric(st.columns(2)[0], "台積電 ADR 溢價（相對台股 2330）", f"{ad['premium'] * 100:+.1f}%",
+                          f"ADR {ad['tsm']:,.2f} 美元 × 匯率 {ad['fx']:.2f} ÷ 5 = {ad['tsm'] * ad['fx'] / 5:,.0f} 元",
+                          delta_color="off", delta_arrow="off", border=True)
+
+            st.markdown("##### 重點摘要")
+            st.markdown("\n".join(f"- {x}" for x in ur["summary"]))
+            ai_recap_button("美股", ur["summary"], "ai_us")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                sec = ur.get("sectors")
+                if sec is not None and len(sec):
+                    bar_chart(sec["name"], sec["pct"], False, "11 大類股（SPDR 類股 ETF）", height=420)
+            with c2:
+                mg = ur.get("mega")
+                if mg is not None and len(mg):
+                    bar_chart(mg["name"], mg["pct"], False, "大型權值股", height=420 if len(mg) <= 12 else 560)
+
+            ucols = {"code": "代號", "name": "名稱", "close": "收盤", "pct": "漲跌"}
+            if ur.get("gainers") is not None:
+                a, b, c = st.columns(3)
+                with a:
+                    st.markdown("##### 🔺 漲幅排行")
+                    pct_table(ur["gainers"], "us_gain", False, ucols)
+                with b:
+                    st.markdown("##### 🔻 跌幅排行")
+                    pct_table(ur["losers"], "us_lose", False, ucols)
+                with c:
+                    st.markdown("##### 🔥 成交最熱")
+                    pct_table(ur["actives"], "us_act", False, ucols)
+                st.caption("排行來自 Yahoo Finance 篩選（市值較大的美股）。點選任一列可開啟分析。")
+            if ur.get("favs") is not None and len(ur["favs"]):
+                st.markdown("##### ⭐ 我的最愛（美股）今日表現")
+                f = ur["favs"].copy()
+                f["name"] = ""
+                pct_table(f, "us_favs", False, ucols)
+
+    st.caption("本工具為個人研究用技術原型，不構成投資建議。")
+    st.stop()
+
+# ============================================================================
+# 頁面三：個股分析
 # ============================================================================
 code = st.session_state.code
 try:
@@ -417,10 +645,11 @@ except engine.DataError as e:
     st.error(str(e))
     st.stop()
 
-up_c, down_c = colors(market)
+up_c, down_c = colors(market, code)
+SESSION = live.session_of(code, market)
 df, last = r["df"], r["last"]
-cur = "NT$" if market == "TW" else "US$"
-mk_label = "台股" if market == "TW" else "美股"
+cur = {"TW": "NT$", "US": "US$"}.get(market, "點")
+mk_label = {"TW": "台股", "US": "美股", "IDX": "指數"}[market]
 is_fav = code in st.session_state.favs
 held = st.session_state.positions.get(code)
 _q0 = get_quotes((code,)).get(code)
@@ -434,13 +663,13 @@ t2.button("★ 已在最愛" if is_fav else "☆ 加入最愛", on_click=toggle_
 st.caption(f"{mk_label}｜分析基準：{r['asof']} 收盤｜{len(df)} 個交易日")
 
 
-@st.fragment(run_every=LIVE_EVERY if live.is_open(market) else None)
+@st.fragment(run_every=LIVE_EVERY if live.is_open(SESSION) else None)
 def live_card():
     q = get_quotes((code,)).get(code)
     if not q:
         st.caption("即時報價暫時取不到，以下以最近收盤資料為準。")
         return
-    opened = live.is_open(market)
+    opened = live.is_open(SESSION)
     chg_col = up_c if (q["chg"] or 0) > 0 else down_c if (q["chg"] or 0) < 0 else "gray"
     dot = "#d1352b" if opened else "#8a8d95"
     notes = []
@@ -525,59 +754,60 @@ def clear_position():
     save_favs()
 
 
-with st.expander("💼 我的持倉分析" + (f"（成本 {held['cost']:,.2f}）" if held else "：輸入買進價，取得停損與操作建議"),
-                 expanded=bool(held)):
-    with st.form(f"pos_form_{code}", border=False):
-        f1, f2, f3, f4 = st.columns(4)
-        f1.number_input("買進價", min_value=0.0, value=float(held["cost"]) if held else None, step=0.5,
-                        format="%.2f", key=f"pos_cost_{code}", placeholder="例如 2300")
-        f2.number_input("股數（選填，1 張 = 1000 股）" if market == "TW" else "股數（選填）", min_value=0.0,
-                        value=float(held["shares"]) if held and held.get("shares") else None, step=1000.0 if market == "TW" else 1.0,
-                        format="%.0f", key=f"pos_shares_{code}")
-        f3.date_input("買進日（選填）", value=dt.date.fromisoformat(held["date"]) if held and held.get("date") else None,
-                      max_value=dt.date.today(), key=f"pos_date_{code}", help="填了才能算買進後最高價，用來設移動停損")
-        f4.number_input("可承受虧損 %", min_value=2.0, max_value=30.0, value=float(held.get("risk", 8)) if held else 8.0,
-                        step=1.0, format="%.0f", key=f"pos_risk_{code}", help="固定停損的幅度，一般 5～10%")
-        b1, b2, _ = st.columns([1, 1, 3])
-        b1.form_submit_button("儲存並分析", type="primary", on_click=save_position, width="stretch")
+if market != "IDX":
+    with st.expander("💼 我的持倉分析" + (f"（成本 {held['cost']:,.2f}）" if held else "：輸入買進價，取得停損與操作建議"),
+                     expanded=bool(held)):
+        with st.form(f"pos_form_{code}", border=False):
+            f1, f2, f3, f4 = st.columns(4)
+            f1.number_input("買進價", min_value=0.0, value=float(held["cost"]) if held else None, step=0.5,
+                            format="%.2f", key=f"pos_cost_{code}", placeholder="例如 2300")
+            f2.number_input("股數（選填，1 張 = 1000 股）" if market == "TW" else "股數（選填）", min_value=0.0,
+                            value=float(held["shares"]) if held and held.get("shares") else None, step=1000.0 if market == "TW" else 1.0,
+                            format="%.0f", key=f"pos_shares_{code}")
+            f3.date_input("買進日（選填）", value=dt.date.fromisoformat(held["date"]) if held and held.get("date") else None,
+                          max_value=dt.date.today(), key=f"pos_date_{code}", help="填了才能算買進後最高價，用來設移動停損")
+            f4.number_input("可承受虧損 %", min_value=2.0, max_value=30.0, value=float(held.get("risk", 8)) if held else 8.0,
+                            step=1.0, format="%.0f", key=f"pos_risk_{code}", help="固定停損的幅度，一般 5～10%")
+            b1, b2, _ = st.columns([1, 1, 3])
+            b1.form_submit_button("儲存並分析", type="primary", on_click=save_position, width="stretch")
+            if held:
+                b2.form_submit_button("清除持倉", on_click=clear_position, width="stretch")
+
         if held:
-            b2.form_submit_button("清除持倉", on_click=clear_position, width="stretch")
+            p = pos_p
+            price_now = p["price"]
+            pc = up_c if p["pnl"] > 0 else down_c if p["pnl"] < 0 else "gray"
+            k1, k2, k3, k4 = st.columns(4)
+            card(k1, "現價／損益", f"{price_now:,.2f}",
+                 f"<span style='color:{pc}'>{p['pnl'] * 100:+.2f}%（扣費 {p['net_pnl'] * 100:+.2f}%）</span>")
+            card(k2, "損益金額" if p["pnl_amt"] is not None else "損益兩平價",
+                 f"<span style='color:{pc}'>{p['pnl_amt']:+,.0f}</span>" if p["pnl_amt"] is not None else f"{p['breakeven']:,.2f}",
+                 f"兩平價 {p['breakeven']:,.2f}" if p["pnl_amt"] is not None else "含買賣手續費與稅")
+            card(k3, "建議停損", f"<span style='color:#b7791f'>{p['stop']:,.2f}</span>",
+                 f"距現價 {(p['stop'] / price_now - 1) * 100:+.1f}%")
+            card(k4, "風險報酬比", "—" if p["rr"] is None else f"{p['rr']:.1f}", f"ATR {p['atr']:,.2f}（{p['atr'] / price_now * 100:.1f}%/日）"
+                 + (f"｜持有 {p['held']} 天" if p["held"] is not None else ""))
+            box_fn = {"danger": st.error, "warn": st.warning, "info": st.info, "good": st.success}[p["level"]]
+            box_fn(f"**{p['head']}**　{p['body']}")
+            st.caption("停損依據：" + p["stop_why"])
+            for e in p["extra"]:
+                st.markdown("- " + e)
 
-    if held:
-        p = pos_p
-        price_now = p["price"]
-        pc = up_c if p["pnl"] > 0 else down_c if p["pnl"] < 0 else "gray"
-        k1, k2, k3, k4 = st.columns(4)
-        card(k1, "現價／損益", f"{price_now:,.2f}",
-             f"<span style='color:{pc}'>{p['pnl'] * 100:+.2f}%（扣費 {p['net_pnl'] * 100:+.2f}%）</span>")
-        card(k2, "損益金額" if p["pnl_amt"] is not None else "損益兩平價",
-             f"<span style='color:{pc}'>{p['pnl_amt']:+,.0f}</span>" if p["pnl_amt"] is not None else f"{p['breakeven']:,.2f}",
-             f"兩平價 {p['breakeven']:,.2f}" if p["pnl_amt"] is not None else "含買賣手續費與稅")
-        card(k3, "建議停損", f"<span style='color:#b7791f'>{p['stop']:,.2f}</span>",
-             f"距現價 {(p['stop'] / price_now - 1) * 100:+.1f}%")
-        card(k4, "風險報酬比", "—" if p["rr"] is None else f"{p['rr']:.1f}", f"ATR {p['atr']:,.2f}（{p['atr'] / price_now * 100:.1f}%/日）"
-             + (f"｜持有 {p['held']} 天" if p["held"] is not None else ""))
-        box_fn = {"danger": st.error, "warn": st.warning, "info": st.info, "good": st.success}[p["level"]]
-        box_fn(f"**{p['head']}**　{p['body']}")
-        st.caption("停損依據：" + p["stop_why"])
-        for e in p["extra"]:
-            st.markdown("- " + e)
-
-        ai_key = secret("ANTHROPIC_API_KEY")
-        if ai_key:
-            if st.button("✨ 讓 Claude 分析這筆交易", key=f"pos_ai_btn_{code}"):
-                try:
-                    with st.spinner("Claude 分析中…"):
-                        titles = [i["title"] for i in get_news(code, market, name)]
-                        st.session_state[f"pos_ai_{code}"] = news.ask_claude(
-                            ai_key, position.prompt(code, name, r, p, titles), model="claude-sonnet-5-5")
-                except Exception as e:
-                    st.warning(f"AI 分析失敗：{e}")
-            if st.session_state.get(f"pos_ai_{code}"):
-                st.info(st.session_state[f"pos_ai_{code}"])
-        else:
-            st.caption("想要更完整的文字分析，可在設定檔加入 ANTHROPIC_API_KEY，這裡會出現「讓 Claude 分析」按鈕。")
-        st.caption("建議以風險控管為主，依據歷史價格與波動計算，不保證報酬，最終決定請自行判斷。")
+            ai_key = secret("ANTHROPIC_API_KEY")
+            if ai_key:
+                if st.button("✨ 讓 Claude 分析這筆交易", key=f"pos_ai_btn_{code}"):
+                    try:
+                        with st.spinner("Claude 分析中…"):
+                            titles = [i["title"] for i in get_news(code, market, name)]
+                            st.session_state[f"pos_ai_{code}"] = news.ask_claude(
+                                ai_key, position.prompt(code, name, r, p, titles), model="claude-sonnet-5-5")
+                    except Exception as e:
+                        st.warning(f"AI 分析失敗：{e}")
+                if st.session_state.get(f"pos_ai_{code}"):
+                    st.info(st.session_state[f"pos_ai_{code}"])
+            else:
+                st.caption("想要更完整的文字分析，可在設定檔加入 ANTHROPIC_API_KEY，這裡會出現「讓 Claude 分析」按鈕。")
+            st.caption("建議以風險控管為主，依據歷史價格與波動計算，不保證報酬，最終決定請自行判斷。")
 
 # --- 圖表（左）＋ 新聞（右） ---
 PLOTLY_CFG = {"scrollZoom": True, "displaylogo": False,
@@ -649,12 +879,12 @@ with tab_k:
             qd = pd.Timestamp(dt.datetime.strptime(q["date"], "%Y%m%d"))
         except ValueError:
             qd = None
-        if qd is not None and qd > last["date"] and (market == "TW" or live.is_open(market)):
+        if qd is not None and qd > last["date"] and (SESSION == "TW" or live.is_open(SESSION)):
             today = {"date": qd.strftime("%Y-%m-%d"), "open": q["open"], "high": q["high"],
                      "low": q["low"], "close": q["price"]}
     embed_html(kchart.build(df, r["cone"], up_c, down_c, STOP_REF, stop_label=STOP_LABEL, today=today, dark=is_dark(),
                                  cost=(st.session_state.positions.get(code) or {}).get("cost"),
-                                 vol_unit="張" if market == "TW" else "股"), height=600)
+                                 vol_unit={"TW": "張", "US": "股"}.get(market, "")), height=600)
     st.caption("藍色帶狀是未來 20 個交易日的 80% 機率區間（依近 60 日波動度估計），不是預言的走勢；"
                "虛線是停損參考；空心 K 棒是今天盤中暫定值，收盤資料更新後才納入評分。")
 
