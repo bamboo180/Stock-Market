@@ -160,9 +160,13 @@ def ai_summary(api_key: str, label: str, items: list[Item], model: str = "claude
         f"以下是「{label}」最近一週的新聞標題。請用繁體中文整理成 3 到 5 點重點，"
         "每點一行，開頭標註【利多】【利空】或【中性】，只根據標題內容，不要編造標題沒有的數字，"
         "不要給買賣建議。最後一行用一句話說明整體消息面偏多、偏空或中性。\n\n" + "\n".join(lines))
+    return ask_claude(api_key, prompt, model)
+
+
+def ask_claude(api_key: str, prompt: str, model: str = "claude-haiku-5-5", max_tokens: int = 800) -> str:
     r = requests.post("https://api.anthropic.com/v1/messages", timeout=60,
                       headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json={"model": model, "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]})
+                      json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]})
     j = r.json()
     if r.status_code != 200:
         raise RuntimeError(j.get("error", {}).get("message", f"HTTP {r.status_code}"))

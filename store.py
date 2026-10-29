@@ -1,4 +1,4 @@
-"""我的最愛的儲存。
+"""我的最愛與持倉（買進價）的儲存。
 
 兩種模式（自動選擇）：
 1. GitHub 模式：Secrets 有 GITHUB_TOKEN 與 GITHUB_REPO 時，存在該 repo 的
@@ -22,6 +22,16 @@ class StoreError(Exception):
     pass
 
 
+def _normalize(data) -> dict:
+    """舊格式（只有最愛清單）自動轉成新格式。"""
+    if isinstance(data, list):
+        data = {"favorites": data}
+    data = data if isinstance(data, dict) else {}
+    pos = data.get("positions") or {}
+    return {"favorites": _clean(data.get("favorites", DEFAULT)),
+            "positions": {str(k).upper(): v for k, v in pos.items() if isinstance(v, dict) and v.get("cost")}}
+
+
 def _clean(items) -> list[str]:
     seen, out = set(), []
     for x in items or []:
@@ -35,19 +45,19 @@ def _clean(items) -> list[str]:
 class LocalStore:
     label = "本機檔案 favorites.json"
 
-    def load(self) -> list[str]:
+    def load(self) -> dict:
         if not os.path.exists(LOCAL_PATH):
-            return list(DEFAULT)
+            return _normalize(None)
         try:
             with open(LOCAL_PATH, encoding="utf-8") as f:
-                return _clean(json.load(f))
+                return _normalize(json.load(f))
         except Exception:
-            return list(DEFAULT)
+            return _normalize(None)
 
-    def save(self, favs: list[str]) -> None:
+    def save(self, data: dict) -> None:
         try:
             with open(LOCAL_PATH, "w", encoding="utf-8") as f:
-                json.dump(_clean(favs), f, ensure_ascii=False, indent=1)
+                json.dump(_normalize(data), f, ensure_ascii=False, indent=1)
         except OSError as e:
             raise StoreError(f"無法寫入 favorites.json：{e}") from e
 
@@ -79,9 +89,9 @@ class GitHubStore:
         j = r.json()
         return json.loads(base64.b64decode(j["content"]).decode("utf-8")), j["sha"]
 
-    def load(self) -> list[str]:
+    def load(self) -> dict:
         data, _ = self._file()
-        return list(DEFAULT) if data is None else _clean(data)
+        return _normalize(data)
 
     def _ensure_branch(self):
         r = self._req("GET", f"/repos/{self.repo}/git/ref/heads/{self.branch}")
@@ -96,11 +106,11 @@ class GitHubStore:
         if c.status_code not in (200, 201):
             raise StoreError(f"建立 {self.branch} 分支失敗（GitHub {c.status_code}）")
 
-    def save(self, favs: list[str]) -> None:
+    def save(self, data: dict) -> None:
         self._ensure_branch()
         _, sha = self._file()
-        body = {"message": "update favorites", "branch": self.branch,
-                "content": base64.b64encode(json.dumps(_clean(favs), ensure_ascii=False, indent=1).encode()).decode()}
+        body = {"message": "update favorites/positions", "branch": self.branch,
+                "content": base64.b64encode(json.dumps(_normalize(data), ensure_ascii=False, indent=1).encode()).decode()}
         if sha:
             body["sha"] = sha
         r = self._req("PUT", f"/repos/{self.repo}/contents/{self.path}", json=body)

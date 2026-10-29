@@ -1,0 +1,108 @@
+code,name,cname,group
+AAPL,Apple,蘋果,科技
+MSFT,Microsoft,微軟,科技
+NVDA,NVIDIA,輝達,半導體
+GOOGL,Alphabet Class A,谷歌 Google,科技
+GOOG,Alphabet Class C,谷歌 Google,科技
+AMZN,Amazon,亞馬遜,電商
+META,Meta Platforms,Meta 臉書,科技
+TSLA,Tesla,特斯拉,電動車
+AVGO,Broadcom,博通,半導體
+TSM,TSMC ADR,台積電 ADR,半導體
+AMD,Advanced Micro Devices,超微,半導體
+INTC,Intel,英特爾,半導體
+QCOM,Qualcomm,高通,半導體
+MU,Micron,美光,半導體
+AMAT,Applied Materials,應用材料,半導體設備
+LRCX,Lam Research,科林研發,半導體設備
+KLAC,KLA,科磊,半導體設備
+ASML,ASML,艾司摩爾,半導體設備
+ARM,Arm Holdings,安謀,半導體
+MRVL,Marvell,邁威爾,半導體
+TXN,Texas Instruments,德州儀器,半導體
+ADI,Analog Devices,亞德諾,半導體
+ON,onsemi,安森美,半導體
+NXPI,NXP,恩智浦,半導體
+SMCI,Super Micro Computer,美超微,伺服器
+DELL,Dell,戴爾,電腦
+HPQ,HP,惠普,電腦
+HPE,Hewlett Packard Enterprise,慧與,伺服器
+ANET,Arista Networks,Arista,網通
+CSCO,Cisco,思科,網通
+GLW,Corning,康寧,材料
+VRT,Vertiv,Vertiv,電力設備
+ORCL,Oracle,甲骨文,軟體
+CRM,Salesforce,Salesforce,軟體
+ADBE,Adobe,Adobe,軟體
+NOW,ServiceNow,ServiceNow,軟體
+PLTR,Palantir,Palantir,軟體
+SNOW,Snowflake,Snowflake,軟體
+IBM,IBM,IBM,科技
+NFLX,Netflix,網飛,媒體
+DIS,Walt Disney,迪士尼,媒體
+UBER,Uber,優步,科技
+ABNB,Airbnb,Airbnb,旅遊
+SHOP,Shopify,Shopify,電商
+PYPL,PayPal,PayPal,金融科技
+COIN,Coinbase,Coinbase,加密貨幣
+MSTR,MicroStrategy (Strategy),微策略,加密貨幣
+V,Visa,Visa,金融
+MA,Mastercard,萬事達卡,金融
+JPM,JPMorgan Chase,摩根大通,金融
+BAC,Bank of America,美國銀行,金融
+GS,Goldman Sachs,高盛,金融
+MS,Morgan Stanley,摩根士丹利,金融
+WFC,Wells Fargo,富國銀行,金融
+BRK-B,Berkshire Hathaway B,波克夏,金融
+JNJ,Johnson & Johnson,嬌生,醫療
+LLY,Eli Lilly,禮來,醫療
+NVO,Novo Nordisk,諾和諾德,醫療
+PFE,Pfizer,輝瑞,醫療
+MRK,Merck,默克,醫療
+ABBV,AbbVie,艾伯維,醫療
+UNH,UnitedHealth,聯合健康,醫療
+KO,Coca-Cola,可口可樂,消費
+PEP,PepsiCo,百事,消費
+PG,Procter & Gamble,寶僑,消費
+MCD,McDonald's,麥當勞,消費
+SBUX,Starbucks,星巴克,消費
+NKE,Nike,耐吉,消費
+WMT,Walmart,沃爾瑪,零售
+COST,Costco,好市多,零售
+HD,Home Depot,家得寶,零售
+BA,Boeing,波音,航太
+CAT,Caterpillar,開拓重工,工業
+GE,GE Aerospace,奇異,航太
+GEV,GE Vernova,GE Vernova,電力設備
+LMT,Lockheed Martin,洛克希德馬丁,國防
+XOM,Exxon Mobil,艾克森美孚,能源
+CVX,Chevron,雪佛龍,能源
+BABA,Alibaba,阿里巴巴,中概股
+PDD,PDD Holdings,拼多多,中概股
+JD,JD.com,京東,中概股
+BIDU,Baidu,百度,中概股
+NIO,NIO,蔚來,中概股
+SPY,SPDR S&P 500 ETF,標普500 ETF,ETF
+VOO,Vanguard S&P 500 ETF,標普500 ETF,ETF
+VTI,Vanguard Total Stock Market ETF,美國全市場 ETF,ETF
+VT,Vanguard Total World Stock ETF,全世界 ETF,ETF
+QQQ,Invesco QQQ,那斯達克100 ETF,ETF
+DIA,SPDR Dow Jones ETF,道瓊 ETF,ETF
+IWM,iShares Russell 2000 ETF,羅素2000 小型股 ETF,ETF
+SOXX,iShares Semiconductor ETF,半導體 ETF,ETF
+SMH,VanEck Semiconductor ETF,半導體 ETF,ETF
+SOXL,Direxion Semiconductor Bull 3X,半導體三倍做多,槓桿ETF
+TQQQ,ProShares UltraPro QQQ,那斯達克三倍做多,槓桿ETF
+SQQQ,ProShares UltraPro Short QQQ,那斯達克三倍做空,槓桿ETF
+SCHD,Schwab US Dividend Equity ETF,美股高股息 ETF,ETF
+VYM,Vanguard High Dividend Yield ETF,美股高股息 ETF,ETF
+TLT,iShares 20+ Year Treasury ETF,20年期美債 ETF,債券ETF
+GLD,SPDR Gold Shares,黃金 ETF,商品ETF
+SLV,iShares Silver Trust,白銀 ETF,商品ETF
+USO,United States Oil Fund,原油 ETF,商品ETF
+XLK,Technology Select Sector SPDR,科技類股 ETF,ETF
+XLF,Financial Select Sector SPDR,金融類股 ETF,ETF
+XLE,Energy Select Sector SPDR,能源類股 ETF,ETF
+XLV,Health Care Select Sector SPDR,醫療類股 ETF,ETF
+ARKK,ARK Innovation ETF,方舟創新 ETF,ETF
+IBIT,iShares Bitcoin Trust,比特幣 ETF,加密貨幣ETF

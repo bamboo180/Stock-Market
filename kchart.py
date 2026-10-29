@@ -12,8 +12,8 @@ def _d(x) -> str:
     return pd.Timestamp(x).strftime("%Y-%m-%d")
 
 
-def build(df: pd.DataFrame, cone: pd.DataFrame, up: str, down: str, stop: float | None,
-          today: dict | None = None, dark: bool = False, height: int = 560, vol_unit: str = "張") -> str:
+def build(df: pd.DataFrame, cone: pd.DataFrame, up: str, down: str, stop: float | None, stop_label: str = "停損參考",
+          today: dict | None = None, dark: bool = False, cost: float | None = None, height: int = 560, vol_unit: str = "張") -> str:
     candles = [{"time": _d(r.date), "open": r.open, "high": r.high, "low": r.low, "close": r.close}
                for r in df.itertuples()]
     vols = [{"time": _d(r.date), "value": float(r.vol),
@@ -32,7 +32,7 @@ def build(df: pd.DataFrame, cone: pd.DataFrame, up: str, down: str, stop: float 
     th = ({"bg": "#0e1117", "fg": "#c9ccd3", "grid": "#262a33", "cone": "rgba(125,155,255,.18)", "tip": "#1c1f26"}
           if dark else
           {"bg": "#ffffff", "fg": "#4a4d55", "grid": "#eef0f3", "cone": "rgba(47,91,211,.12)", "tip": "#ffffff"})
-    data = json.dumps({"candles": candles, "vols": vols, "ma": ma, "cone": cone_d, "stop": stop,
+    data = json.dumps({"candles": candles, "vols": vols, "ma": ma, "cone": cone_d, "stop": stop, "stopLabel": stop_label, "cost": cost,
                        "up": up, "down": down, "th": th, "unit": vol_unit})
 
     return f"""
@@ -90,7 +90,8 @@ cs.setData(D.candles.map(({{provisional, ...c}}) => c));
 const line = (data, color) => {{ const s = chart.addLineSeries({{color, lineWidth: 1.5, priceLineVisible: false,
   lastValueVisible: false, crosshairMarkerVisible: false}}); s.setData(data); return s; }};
 const m20 = line(D.ma.ma20, '#b7791f'), m60 = line(D.ma.ma60, '#8a8d95');
-if (D.stop) cs.createPriceLine({{price: D.stop, color: '#b7791f', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '停損參考'}});
+if (D.stop) cs.createPriceLine({{price: D.stop, color: '#b7791f', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: D.stopLabel}});
+if (D.cost) cs.createPriceLine({{price: D.cost, color: '#7c3aed', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: '我的成本'}});
 
 // 資訊列
 const byTime = new Map(D.candles.map((c, i) => [c.time, i]));
