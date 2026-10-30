@@ -7,6 +7,7 @@ import logging
 import hmac
 import inspect
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -27,7 +28,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.0（2026-10-30）"
+APP_VERSION = "v2.1（2026-10-30）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -102,7 +103,46 @@ if APP_PASSWORD and not st.session_state.get("authed"):
 
 SAVED_TOKEN = secret("FINMIND_TOKEN")
 company.set_sec_contact(secret("SEC_CONTACT"))
-PERIODS = {"1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825}
+PERIODS = {"6 個月": 183, "1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825, "10 年": 3650}
+MIN_DAYS, MAX_DAYS = 183, 365 * 20
+
+
+def parse_period(text: str) -> tuple[int, str]:
+    """把「6個月」「18個月」「3年」「250天」「12週」「2024-01-01」這類輸入轉成天數。"""
+    t = str(text or "").strip().replace(" ", "").lower()
+    if t in {k.replace(" ", "") for k in PERIODS}:
+        k = next(k for k in PERIODS if k.replace(" ", "") == t)
+        return PERIODS[k], k
+    m = re.fullmatch(r"(\d{4})[-/.年](\d{1,2})(?:[-/.月](\d{1,2})日?)?", t)
+    if m:
+        d0 = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3) or 1))
+        return (dt.date.today() - d0).days, f"{d0:%Y-%m-%d} 起"
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(天|日|d|day|days|週|周|w|week|weeks|個月|月|m|mo|month|months|年|y|yr|year|years)?", t)
+    if not m:
+        raise ValueError(f"看不懂「{text}」，可以輸入例如：6個月、18個月、3年、250天、2024-01-01")
+    n, u = float(m.group(1)), (m.group(2) or "年")
+    mult = 1 if u in ("天", "日", "d", "day", "days") else 7 if u in ("週", "周", "w", "week", "weeks") \
+        else 30.44 if u in ("個月", "月", "m", "mo", "month", "months") else 365.25
+    unit_zh = {1: "天", 7: "週", 30.44: "個月", 365.25: "年"}[mult]
+    return int(round(n * mult)), f"{n:g} {unit_zh}"
+
+
+def on_period_change():
+    try:
+        d, label = parse_period(st.session_state.period_pick)
+    except ValueError as e:
+        st.session_state.store_err = str(e)
+        st.session_state.period_pick = st.session_state.get("period_label", "2 年")
+        return
+    note = ""
+    if d < MIN_DAYS:
+        d, note = MIN_DAYS, f"（{label}太短，分析至少需要約半年資料，已改為 6 個月）"
+    elif d > MAX_DAYS:
+        d, note = MAX_DAYS, "（最多 20 年）"
+    st.session_state.period_days = d
+    st.session_state.period_label = st.session_state.period_pick
+    if note:
+        st.session_state.store_err = "資料期間" + note
 LIVE_EVERY = 60          # 盤中即時報價更新秒數
 VIEWS = ["📈 市場總覽", "📰 盤後整理", "🔍 個股分析"]
 HOME, RECAP, STOCK = VIEWS
@@ -404,7 +444,13 @@ if "nav" not in st.session_state:
 with st.sidebar:
     st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed")
     search_box("search", "🔍 搜尋股票", on_search)
-    period = st.selectbox("資料期間", list(PERIODS), index=1)
+    if "period_pick" not in st.session_state:
+        st.session_state.period_pick, st.session_state.period_days = "2 年", 730
+    popts = list(PERIODS)
+    if st.session_state.period_pick not in popts:
+        popts = [st.session_state.period_pick] + popts
+    st.selectbox("資料期間", popts, key="period_pick", on_change=on_period_change, accept_new_options=True,
+                 help="可直接選，也可以自己打：例如 18個月、4年、250天、2024-01-01（從這天到今天）")
 
     st.caption("⭐ 我的最愛")
     if st.session_state.favs:
@@ -431,7 +477,7 @@ if st.session_state.nav != HOME:
 if st.session_state.get("store_err"):
     st.warning(st.session_state.store_err)
 
-days = PERIODS[period]
+days = int(st.session_state.get("period_days", 730))
 any_open = live.is_open("TW") or live.is_open("US")
 
 
@@ -621,11 +667,32 @@ if st.session_state.nav == HOME:
 # ============================================================================
 # 頁面二：盤後整理
 # ============================================================================
+_SUFFIX = re.compile(r"[,.]?\s+(American Depositary Shares?|Depositary Shares?|Companies|Inc|Corp|Corporation|Company|Co|Ltd|Limited|Holdings?|Group|plc|PLC|N\.?V|S\.?A|AG|SE|LLC|L\.?P|"
+                     r"Incorporated|Sponsored|ADR|Class [A-C]|Common Stock|Ordinary Shares)\b\.?", re.I)
+
+
+def short_name(code: str, name) -> str:
+    """有中文名用中文名；英文名去掉 Inc.、Corporation 這類字尾，最多 18 個字。"""
+    zh = name_table().get(code, {}).get("name", "")
+    if zh and not zh.isascii():
+        return zh
+    n = str(name or "")
+    for _ in range(3):
+        n = _SUFFIX.sub("", n).strip(" ,.")
+    return n if len(n) <= 18 else n[:17] + "…"
+
+
 def pct_table(df: pd.DataFrame, key: str, tw_colors: bool, cols: dict, height: int | None = None):
     """可點選的漲跌表，點一列開啟個股分析。"""
     if df is None or df.empty:
         st.caption("暫無資料")
         return
+    df = df.copy()
+    if "name" in df:
+        df["name"] = [short_name(c, n) for c, n in zip(df["code"], df["name"])]
+    # 欄位順序：代號 → 漲跌 → 收盤 → 名稱（漲跌一進來就看得到，不會被長名稱擠出畫面）
+    order = [k for k in ("code", "pct", "close", "name", "value") if k in cols]
+    cols = {k: cols[k] for k in order}
     show = df.rename(columns=cols)[list(cols.values())].reset_index(drop=True)
     up, down = ("#d1352b", "#14825a") if tw_colors else ("#14825a", "#d1352b")
     pct_col = cols.get("pct")
@@ -653,8 +720,11 @@ def pct_table(df: pd.DataFrame, key: str, tw_colors: bool, cols: dict, height: i
         if rows:
             open_stock(codes[rows[0]])
 
+    cfg = {"代號": st.column_config.TextColumn(width="small"), "漲跌": st.column_config.TextColumn(width="small"),
+           "收盤": st.column_config.TextColumn(width="small"), "名稱": st.column_config.TextColumn(width="medium")}
     st.dataframe(show.style.apply(style).format(fmt), hide_index=True, width="stretch", key=key,
-                 on_select=on_pick, selection_mode="single-row", **({"height": height} if height else {}))
+                 on_select=on_pick, selection_mode="single-row", column_config=cfg,
+                 **({"height": height} if height else {}))
 
 
 def bar_chart(names, values, tw_colors: bool, title: str, unit: str = "%", height: int = 360):
@@ -839,7 +909,7 @@ if st.session_state.nav == RECAP:
             if ur.get("favs") is not None and len(ur["favs"]):
                 st.markdown("##### ⭐ 我的最愛（美股）今日表現")
                 f = ur["favs"].copy()
-                f["name"] = ""
+                f["name"] = [name_table().get(c, {}).get("name", "") for c in f["code"]]
                 pct_table(f, "us_favs", False, ucols)
 
     st.caption("本工具為個人研究用技術原型，不構成投資建議。")
