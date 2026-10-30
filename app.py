@@ -28,7 +28,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.1（2026-10-30）"
+APP_VERSION = "v2.2（2026-10-31）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -436,10 +436,29 @@ def on_table_select():
 # ----------------------------------------------------------------------------
 # 側邊欄
 # ----------------------------------------------------------------------------
+# 網址記住目前頁面、股票與資料期間：按瀏覽器重新整理（F5）會留在原地，不會跳回首頁
+QP_VIEW = {"home": HOME, "recap": RECAP, "stock": STOCK}
+QP_KEY = {v: k for k, v in QP_VIEW.items()}
+if "nav" not in st.session_state:
+    _qp = st.query_params
+    _v = QP_VIEW.get(_qp.get("v", ""), HOME)
+    _c = (_qp.get("s") or "").strip()
+    if _c and market_of(_c) != "?":
+        st.session_state.code = _c
+    elif _v == STOCK:
+        _v = HOME
+    st.session_state.nav = _v
+    _p = _qp.get("p")
+    if _p and "period_pick" not in st.session_state:
+        try:
+            _d, _ = parse_period(_p)
+            st.session_state.period_pick = _p
+            st.session_state.period_label = _p
+            st.session_state.period_days = min(max(_d, MIN_DAYS), MAX_DAYS)
+        except ValueError:
+            pass
 if "code" not in st.session_state:
     st.session_state.code = (st.session_state.favs or ["2330"])[0]
-if "nav" not in st.session_state:
-    st.session_state.nav = HOME
 
 with st.sidebar:
     st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed")
@@ -471,6 +490,13 @@ with st.sidebar:
     st.caption(f"版本 {APP_VERSION}")
 
 st.session_state.pop("jump", None)
+_want = {"v": QP_KEY[st.session_state.nav]}
+if st.session_state.nav == STOCK:
+    _want["s"] = st.session_state.code
+if st.session_state.get("period_pick", "2 年") != "2 年":
+    _want["p"] = st.session_state.period_pick
+if {k: st.query_params.get(k) for k in st.query_params} != _want:
+    st.query_params.from_dict(_want)
 if st.session_state.nav != HOME:
     st.button("🏠 回首頁", on_click=go_home, type="tertiary")
 
@@ -1033,7 +1059,7 @@ st.markdown(f"<div class='ai'>{P['summary'] if P else r['explain']}</div>", unsa
 
 
 # --- 🕒 盤前／盤中／盤後整理 ---
-@st.fragment(run_every=LIVE_EVERY if live.is_open(SESSION) else None)
+@st.fragment(run_every=LIVE_EVERY if live.is_open(SESSION) else 300)   # 收盤後每 5 分鐘檢查，開盤時自動換成新的一天
 def session_box():
     q = get_quotes((code,)).get(code)
     try:
@@ -1071,22 +1097,44 @@ def session_box():
         st.markdown(f"**{sec['title']}**")
         metric_row(sec)
         lines(sec)
-        d = sec.get("intra")
-        if d is not None:
-            prev = float(r["df"]["close"].iloc[-2] if r["df"]["date"].iloc[-1].date() == live.now(SESSION).date()
-                         else r["df"]["close"].iloc[-1])
-            last_px = float(d["Close"].iloc[-1])
-            col = up_c if last_px >= prev else down_c
-            fig = go.Figure(go.Scatter(x=d["time"], y=d["Close"], mode="lines", line=dict(color=col, width=2),
-                                       fill="tozeroy", fillcolor="rgba(0,0,0,0)", name="5 分 K 收盤"))
-            fig.add_hline(y=prev, line_dash="dot", line_color="gray", annotation_text=f"昨收 {prev:,.2f}",
-                          annotation_position="bottom right")
-            lo, hi = float(d["Low"].min()), float(d["High"].max())
-            pad = (max(hi, prev) - min(lo, prev)) * 0.08 or 1
-            fig.update_layout(height=220, margin=dict(l=0, r=0, t=10, b=0), showlegend=False, dragmode=False,
-                              yaxis=dict(range=[min(lo, prev) - pad, max(hi, prev) + pad]))
+        ch = sec.get("chart") or {}
+        if ch.get("day"):
+            d = ch["rows"]
+            prev = ch["prev"]
+            fig = go.Figure()
+            ys = []
+            if d is not None:
+                last_px = float(d["Close"].iloc[-1])
+                col = up_c if prev is None or last_px >= prev else down_c
+                fig.add_trace(go.Scatter(x=d["time"], y=d["Close"], mode="lines", line=dict(color=col, width=2),
+                                         name="5 分 K 收盤", hovertemplate="%{x|%H:%M}　%{y:,.2f}<extra></extra>"))
+                ys += [float(d["Low"].min()), float(d["High"].max())]
+            if prev:
+                fig.add_hline(y=prev, line_dash="dot", line_color="gray", annotation_text=f"昨收 {prev:,.2f}",
+                              annotation_position="bottom right")
+                ys.append(prev)
+            lo, hi = (min(ys), max(ys)) if ys else (0, 1)
+            pad = (hi - lo) * 0.08 or max(abs(hi) * 0.01, 1)
+            tick = 30 if SESSION == "TW" else 60          # 台股每 30 分鐘、美股每 1 小時一個刻度
+            tv = list(pd.date_range(ch["start"], ch["end"], freq=f"{tick}min"))
+            if tv[-1] != ch["end"]:
+                tv.append(pd.Timestamp(ch["end"]))      # 收盤時間一定要有刻度
+            fig.update_layout(height=220, margin=dict(l=0, r=8, t=10, b=0), showlegend=False, dragmode=False,
+                              yaxis=dict(range=[lo - pad, hi + pad]),
+                              xaxis=dict(range=[ch["start"] - dt.timedelta(minutes=6), ch["end"] + dt.timedelta(minutes=12)],
+                                         tickvals=tv,
+                                         ticktext=[f"{x:%H:%M}" for x in tv]))
             st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=f"intra_{code}")
-            st.caption("走勢為 Yahoo 5 分 K（台股約延遲 20 分鐘）" + ("，含美股盤前盤後" if market == "US" else ""))
+            if SESSION == "TW":
+                tz_note = "台灣時間"
+            else:
+                _tw = [dt.datetime.combine(ch["day"], x.time()).replace(tzinfo=live.TZ["US"]).astimezone(live.TZ["TW"])
+                       for x in (ch["start"], ch["end"])]
+                tz_note = f"美東時間（＝台灣 {_tw[0]:%H:%M}～{_tw[1]:%H:%M}）"
+            today_ex = live.now(SESSION).date()
+            day_note = "今天" if ch["day"] == today_ex else f"{ch['day']:%m/%d}（最近一個交易日，下次開盤時換成新的一天）"
+            wait_note = "；今日資料還沒進來（Yahoo 約延遲 20 分鐘），稍後會自動出現" if ch.get("waiting") else ""
+            st.caption(f"{day_note}走勢｜時間軸為完整交易時段，{tz_note}｜Yahoo 5 分 K{wait_note}")
     with t_post:
         sec = b["post"]
         st.markdown(f"**{sec['title']}**")

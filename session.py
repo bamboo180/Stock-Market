@@ -55,13 +55,58 @@ def intraday(code: str, market: str) -> pd.DataFrame:
     tickers = [code + ".TW", code + ".TWO"] if market == "TW" else [code]
     for t in tickers:
         try:
-            d = yf.Ticker(t).history(period="1d", interval="5m", prepost=(market == "US"))
+            # 抓 5 天：收盤後到隔天開盤前，仍要顯示最近一個交易日的走勢
+            d = yf.Ticker(t).history(period="5d", interval="5m", prepost=(market == "US"))
         except Exception:
             continue
         if d is not None and not d.empty:
             d = d.reset_index().rename(columns={"Datetime": "time", "Date": "time"})
             return d[["time", "Open", "High", "Low", "Close", "Volume"]]
     return pd.DataFrame()
+
+
+def pick_chart_day(intra: pd.DataFrame | None, sess: str, ph: str, now: dt.datetime, df: pd.DataFrame) -> dict:
+    """決定「今日走勢」圖要畫哪一天。
+
+    盤中：畫今天（就算 Yahoo 還沒資料，也先畫出完整時段的空白座標軸）
+    收盤後、週末、隔天開盤前：繼續畫最近一個交易日，等下一次開盤才換成新的一天
+    圖只畫正規交易時段，x 軸固定為整個時段（台股 09:00～13:30、美股美東 09:30～16:00）
+    """
+    a, b = session_bounds(sess)
+    out = {"rows": None, "day": None, "prev": None, "start": None, "end": None, "pre_rows": None, "waiting": False}
+    rows = None
+    if intra is not None and len(intra):
+        try:
+            t = pd.to_datetime(intra["time"])
+            t = t.dt.tz_convert(live.TZ[sess]) if t.dt.tz is not None else t
+            rows = intra.assign(time=t.dt.tz_localize(None) if t.dt.tz is not None else t)
+        except Exception:
+            rows = None
+    today = now.date()
+    if rows is not None and len(rows):
+        tt = rows["time"].dt.time
+        # 美股今天開盤前的盤前成交
+        pre = rows[(rows["time"].dt.date == today) & (tt < a)]
+        out["pre_rows"] = pre if len(pre) else None
+        rows = rows[(tt >= a) & (tt <= b)]
+    if ph == "live" and now.weekday() < 5:
+        day = today
+    elif rows is not None and len(rows):
+        day = rows["time"].dt.date.max()
+    else:
+        day = None
+    if day is None:
+        return out
+    day_rows = rows[rows["time"].dt.date == day] if rows is not None and len(rows) else rows
+    out["day"] = day
+    out["start"] = dt.datetime.combine(day, a)
+    out["end"] = dt.datetime.combine(day, b)
+    out["rows"] = day_rows if day_rows is not None and len(day_rows) else None
+    out["waiting"] = out["rows"] is None
+    before = df[df["date"].dt.date < day]
+    if len(before):
+        out["prev"] = float(before["close"].iloc[-1])
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -129,16 +174,9 @@ def build(code: str, market: str, sess: str, r: dict, q: dict | None, P: dict | 
           ov: dict | None, idx_q: dict | None, stop: float, stop_label: str, intra: pd.DataFrame | None) -> dict:
     df = r["df"]
     now = live.now(sess)
-    if intra is not None and len(intra):
-        try:
-            t = pd.to_datetime(intra["time"])
-            t = t.dt.tz_convert(live.TZ[sess]) if t.dt.tz is not None else t
-            intra = intra[t.dt.date == now.date()]
-        except Exception:
-            pass
-        if not len(intra):
-            intra = None
     ph = phase(sess, now)
+    chart = pick_chart_day(intra, sess, ph, now, df)
+    intra = chart["pre_rows"]           # 美股今天的盤前成交（只用在盤前文字）
     today = now.date()
     vol_unit = "張" if market == "TW" else "股"
 
@@ -257,7 +295,7 @@ def build(code: str, market: str, sess: str, r: dict, q: dict | None, P: dict | 
     else:
         lines.append("今天沒有交易資料（可能是休市）。")
     out["live"] = {"title": "盤中動態" if ph == "live" else "今日盤中回顧" if ph == "post" else "盤中動態",
-                   "lines": lines, "metrics": metrics, "intra": intra if intra is not None and len(intra) else None}
+                   "lines": lines, "metrics": metrics, "chart": chart}
 
     # ======================= 盤後 =======================
     lines, metrics = [], []

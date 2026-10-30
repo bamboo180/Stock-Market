@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo 股票訊號看板 v2.1
+echo 股票訊號看板 v2.2
 echo 關閉舊版（如果還在執行）...
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8501" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 echo 檢查套件...
