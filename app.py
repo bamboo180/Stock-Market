@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import company
 import engine
 import indices
 import kchart
@@ -960,8 +961,98 @@ def is_dark() -> bool:
 
 main, side = st.columns([2.4, 1], gap="medium")
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_registry():
+    return company.tw_registry()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_company(code: str, market: str, name: str, price: float, token: str):
+    if market == "TW":
+        g = get_groups(token or "")
+        grp = g.loc[g["code"] == code, "group"]
+        return company.tw(code, name, get_registry(), price, token or None, grp.iloc[0] if len(grp) else "")
+    cname = next((o.split("・")[0].split(" ", 1)[1] for o in SEARCH_OPTS if o.startswith(code + " ")), "")
+    return company.us(code, cname)
+
+
+def kv_html(rows) -> str:
+    out = []
+    for k, v in rows:
+        v = str(v)
+        val = f"<a href='{v}' target='_blank'>{v}</a>" if v.startswith("http") else v
+        out.append("<div style='display:flex;gap:10px;padding:3px 0;border-bottom:1px dashed rgba(128,128,128,.2)'>"
+                   f"<span class='small' style='min-width:6.5em'>{k}</span>"
+                   f"<span style='word-break:break-all'>{val}</span></div>")
+    return "".join(out)
+
+
+def company_panel():
+    if market == "IDX":
+        st.caption("指數沒有公司資料。")
+        return
+    try:
+        with st.spinner("抓取公司資料中…"):
+            ci = get_company(code, market, name, float(r["close"]), token or "")
+    except Exception as e:
+        st.caption(f"公司資料暫時取不到：{e}")
+        return
+    w = ci.get("wiki")
+    if w:
+        st.markdown(f"<div style='line-height:1.75'>{w['text']}</div>"
+                    f"<div class='small'>來源：<a href='{w['url']}' target='_blank'>維基百科「{w['title']}」</a></div>",
+                    unsafe_allow_html=True)
+    elif ci.get("summary_en"):
+        st.markdown(f"<div style='line-height:1.6;font-size:.92rem'>{ci['summary_en'][:700]}"
+                    f"{'…' if len(ci['summary_en']) > 700 else ''}</div><div class='small'>來源：Yahoo Finance</div>",
+                    unsafe_allow_html=True)
+    else:
+        st.caption("找不到公司簡介。")
+    ai_key = secret("ANTHROPIC_API_KEY")
+    if ai_key and (ci.get("summary_en") or w):
+        if st.button("✨ 請 Claude 用白話說明這家公司在做什麼", key=f"co_ai_{code}", width="stretch"):
+            try:
+                with st.spinner("Claude 撰寫中…"):
+                    src = (w["text"] if w else "") + "\n" + ci.get("summary_en", "")
+                    st.session_state[f"co_ai_txt_{code}"] = news.ask_claude(ai_key, (
+                        f"請用繁體中文、150 字內，向一般投資人說明「{code} {name}」這家公司靠什麼賺錢、主要產品與客戶、"
+                        f"所屬產業鏈位置。只根據以下資料，不要編造：\n{src}"))
+            except Exception as e:
+                st.warning(f"AI 說明失敗：{e}")
+        if st.session_state.get(f"co_ai_txt_{code}"):
+            st.info(st.session_state[f"co_ai_txt_{code}"])
+
+    if ci.get("rows"):
+        st.markdown("**基本資料**")
+        st.markdown(kv_html(ci["rows"]), unsafe_allow_html=True)
+    if ci.get("valuation"):
+        st.markdown("**估值**")
+        st.markdown(kv_html(ci["valuation"]), unsafe_allow_html=True)
+    m = ci.get("margin")
+    if m:
+        st.markdown(f"**獲利能力（{m['季度']}）**")
+        st.markdown(kv_html([(k, f"{m[k] * 100:.1f}%") for k in ("毛利率", "營益率", "淨利率") if pd.notna(m.get(k))]),
+                    unsafe_allow_html=True)
+    if ci.get("eps") is not None and len(ci["eps"]):
+        e = ci["eps"]
+        st.markdown("**每季 EPS（元）**" + (f"　近 4 季合計 {ci['eps_ttm']:.2f}" if ci.get("eps_ttm") else ""))
+        fig = go.Figure(go.Bar(x=e["季度"], y=e["EPS（元）"], text=[f"{v:.2f}" for v in e["EPS（元）"]],
+                               textposition="outside", cliponaxis=False,
+                               marker_color=[up_c if v >= 0 else down_c for v in e["EPS（元）"]]))
+        fig.update_layout(height=200, margin=dict(l=0, r=0, t=16, b=0), yaxis=dict(visible=False), dragmode=False)
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=f"eps_{code}")
+    if ci.get("dividends") is not None and len(ci["dividends"]):
+        st.markdown("**近期股利（元）**")
+        st.dataframe(ci["dividends"], hide_index=True, width="stretch")
+    st.caption("資料：證交所／櫃買中心公司基本資料、FinMind、維基百科" if market == "TW" else "資料：Yahoo Finance、維基百科")
+
+
 with side:
-    st.markdown("#### 📰 重點消息")
+    tab_co, tab_news = st.tabs(["🏢 公司資料", "📰 重點消息"])
+with tab_co:
+    with st.container(height=760, border=False):
+        company_panel()
+with tab_news:
     with st.spinner("抓取新聞中…"):
         items = get_news(code, market, name)
     only_key = st.toggle("只看重點", value=True, help="財報、營收、法說、股利、評等、籌碼、營運、風險相關，以及官方重大訊息")
@@ -1034,8 +1125,8 @@ with tab_chip:
         fig3 = go.Figure()
         for col, nm, colr in [("foreign", "外資", "#2f5bd3"), ("trust", "投信", "#d1352b"), ("dealer", "自營商", "#8a8d95")]:
             fig3.add_trace(go.Bar(x=bar["date"], y=bar[col], name=nm, marker_color=colr))
-        fig3.update_layout(barmode="relative", height=300, margin=dict(l=10, r=10, t=30, b=10),
-                           title="近 60 日三大法人每日買賣超（張）", legend=dict(orientation="h", y=1.15))
+        fig3.update_layout(barmode="relative", height=320, margin=dict(l=10, r=10, t=36, b=10),
+                           legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0))
         fig3.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     else:
         st.markdown("美股沒有每日公布的法人買賣超，改看 OBV 能量潮（量能是否支持價格）與相對 S&P 500 的強弱。")
@@ -1048,6 +1139,7 @@ with tab_chip:
                        hovermode="x unified", dragmode="pan")
     st.plotly_chart(fig2, width="stretch", config=PLOTLY_CFG)
     if fig3 is not None:
+        st.markdown("**近 60 日三大法人每日買賣超（張）**")
         fig3.update_layout(dragmode="pan")
         st.plotly_chart(fig3, width="stretch", config=PLOTLY_CFG)
 
