@@ -54,6 +54,10 @@ def analyze(df: pd.DataFrame, r: dict, price: float, cost: float, shares: float 
     reward, risk = up_to - price, max(price - stop, 1e-9)
     rr = None if triggered else reward / risk
     score, n = r["score"], r["n_parts"]
+    p10 = r.get("p10")
+    if p10 is not None:            # 有上漲機率時，用機率取代技術評分
+        score = 1 if p10 >= 0.55 else -1 if p10 <= 0.45 else 0
+    trend = f"10 日上漲機率 {p10 * 100:.0f}%" if p10 is not None else f"評分 {r['score']:+d}"
     below20 = pd.notna(ma20) and price < ma20
 
     # ---------- 建議 ----------
@@ -66,13 +70,13 @@ def analyze(df: pd.DataFrame, r: dict, price: float, cost: float, shares: float 
         level, head = "danger", "已觸及停損條件"
         body = (f"現價 {price:,.2f} 已在建議停損 {stop:,.2f} 之下（虧損 {pnl * 100:.1f}%）。照紀律應該出場，"
                 "或至少先減碼一半，不要因為「等反彈」而讓虧損擴大。")
-    elif pnl < 0 and (score <= -1 or below20):
+    elif pnl < 0 and (score <= -1 or (below20 and score <= 0)):
         level, head = "warn", "虧損中，趨勢偏弱"
-        body = (f"目前虧損 {pnl * 100:.1f}%，評分 {score:+d}{'，股價在月線之下' if below20 else ''}。"
+        body = (f"目前虧損 {pnl * 100:.1f}%，{trend}{'，股價在月線之下' if below20 else ''}。"
                 f"嚴守停損 {stop:,.2f}；若反彈到月線 {ma20:,.2f} 附近仍站不上，可考慮減碼。不建議攤平。")
     elif pnl < 0:
         level, head = "info", "虧損中，趨勢尚可"
-        body = (f"目前虧損 {pnl * 100:.1f}%，但評分 {score:+d}、趨勢沒有轉壞，可以續抱觀察，"
+        body = (f"目前虧損 {pnl * 100:.1f}%，但{trend}、趨勢沒有轉壞，可以續抱觀察，"
                 f"停損設在 {stop:,.2f}，跌破就執行。")
     elif score >= 1 and not below20:
         level, head = "good", "獲利中，趨勢偏多"
@@ -80,7 +84,7 @@ def analyze(df: pd.DataFrame, r: dict, price: float, cost: float, shares: float 
                 f"移動停損上移到 {stop:,.2f}，跌破再出場。")
     else:
         level, head = "warn", "獲利中，但趨勢轉弱"
-        body = (f"目前獲利 {pnl * 100:.1f}%，但評分 {score:+d}{'、已跌破月線' if below20 else ''}。"
+        body = (f"目前獲利 {pnl * 100:.1f}%，但{trend}{'、已跌破月線' if below20 else ''}。"
                 f"可以考慮分批獲利了結（例如先賣一半），剩下的用移動停損 {stop:,.2f} 保護。")
 
     extra = []
@@ -118,7 +122,8 @@ def prompt(code: str, name: str, r: dict, p: dict, news_titles: list[str]) -> st
 {f"持有 {p['held']} 天，買進後最高收盤 {p['peak']:,.2f}" if p['held'] is not None else ''}
 ATR(14) {p['atr']:,.2f}（{p['atr'] / p['price'] * 100:.1f}%/日），月線 {p['ma20']:,.2f}，季線 {p['ma60']:,.2f}
 系統建議停損 {p['stop']:,.2f}（{p['stop_why']}）
-技術評分 {r['score']:+d}／±{r['n_parts']}：{parts}
+技術條件：{parts}
+綜合上漲機率：明日 {r.get('p1', 0.5) * 100:.0f}%、10 日 {r.get('p10', 0.5) * 100:.0f}%（含技術、籌碼、營收、新聞、隔夜美股）
 未來 10 日 80% 區間 {r['d10']['p10'] * 100:+.1f}% ~ {r['d10']['p90'] * 100:+.1f}%
 注意：這套評分回測時預測力很弱，請以風險控管為主，不要把評分當成漲跌預測。
 近期新聞標題：

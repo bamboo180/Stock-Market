@@ -18,6 +18,7 @@ import kchart
 import live
 import news
 import position
+import prob
 import recap
 import store
 import symbols
@@ -39,6 +40,9 @@ st.markdown("""
 .live .row{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline}
 .live .px{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums}
 [data-testid="InputInstructions"]{display:none!important}
+.lim{display:inline-block;color:#fff!important;padding:0 .4em;border-radius:5px;font-weight:700}
+.lim-up{background:#d1352b}.lim-down{background:#14825a}
+.lim-tag{display:inline-block;color:#fff;font-size:.75rem;font-weight:700;padding:1px 7px;border-radius:4px;margin-left:6px;vertical-align:middle}
 .st-key-idx [data-testid="stMetricValue"]{font-size:1.45rem}
 .st-key-idx [data-testid="stMetricLabel"] p{font-size:.85rem}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
@@ -112,6 +116,54 @@ def load(code: str, days: int, token: str | None):
 def analyze(code: str, days: int, token: str | None):
     market, name, raw = load(code, days, token)
     return market, name, engine.analyze(raw, market)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_news(code: str, market: str, name: str):
+    if market == "IDX":
+        q = {"^TWII": "台股 加權指數", "^TWOII": "櫃買指數 上櫃"}.get(code, f"{name or code}")
+        lang = "zh" if code in ("^TWII", "^TWOII") or not name.isascii() else "en"
+        return news._dedupe(news._google(f"{q} when:3d", lang))[:30]
+    return news.fetch(code, market, name)
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def get_rev(code: str, token: str):
+    return prob.revenue(code, token or None)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_ov():
+    try:
+        return prob.overnight()
+    except Exception:
+        return {"ok": False, "nq": 0.0}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_prob(code: str, days: int, token: str | None):
+    market, name, r = analyze(code, days, token)
+    try:
+        items = get_news(code, market, name)
+    except Exception:
+        items = []
+    rev = get_rev(code, token or "") if market == "TW" else None
+    return prob.estimate(r, code, items, rev, get_ov())
+
+
+def with_prob(r: dict, P: dict | None) -> dict:
+    if not P:
+        return r
+    return {**r, "p1": P["next"]["p_up"], "p10": P["h10"]["p_up"]}
+
+
+def price_html(price: float, state: str, color: str, size: str = "") -> str:
+    """漲停紅底白字、跌停綠底白字。"""
+    txt = f"{price:,.2f}"
+    if state:
+        return (f"<span class='lim lim-{state}' style='{size}'>{txt}</span>"
+                f"<span class='lim-tag lim-{state}'>{'漲停' if state == 'up' else '跌停'}</span>")
+    return f"<span style='color:{color};{size}'>{txt}</span>"
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -348,16 +400,24 @@ if st.session_state.nav == HOME:
             if len(favs) > 1:
                 prog.caption(f"分析中 {i + 1}/{len(favs)}：{c}")
             row = {"代號": c, "名稱": "", "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
-                   "現價": None, "漲跌": "—", "評分": None, "判讀": "", "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
+                   "現價": None, "漲跌": "—", "明日漲機率": None, "10日漲機率": None, "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
                 market, name, r = analyze(c, 730, token)
-                row.update({"名稱": name, "評分": r["score"], "判讀": r["verdict"],
+                try:
+                    Pc = get_prob(c, 730, token)
+                except Exception:
+                    Pc = None
+                r = with_prob(r, Pc)
+                row.update({"名稱": name,
+                            "明日漲機率": round(Pc["next"]["p_up"] * 100) if Pc else None,
+                            "10日漲機率": round(Pc["h10"]["p_up"] * 100) if Pc else None,
                             "10日區間": f"{r['d10']['p10'] * 100:+.1f}% ~ {r['d10']['p90'] * 100:+.1f}%",
                             "停損參考": round(r["stop"], 2), "現價": r["close"], "漲跌": fmt_chg(r["chg"]),
                             "狀態": f"收盤 {r['asof']}"})
                 qq = q.get(c)
                 if qq:
-                    row.update({"現價": qq["price"], "漲跌": fmt_chg(qq["chg"]),
+                    lim = live.limit_state(qq["price"], qq.get("prev"), market, qq)
+                    row.update({"現價": qq["price"], "漲跌": fmt_chg(qq["chg"]) + {"up": " 漲停", "down": " 跌停"}.get(lim, ""),
                                 "名稱": name or qq.get("name", ""),
                                 "狀態": f"即時 {qq['time']}" if live.is_open(live.session_of(c, market)) else f"最新 {qq['time']}"})
                 pos = st.session_state.positions.get(c)
@@ -387,13 +447,18 @@ if st.session_state.nav == HOME:
                 styles[row.index.get_loc("持倉損益")] = f"color:{up}"
             elif pl.startswith("▼"):
                 styles[row.index.get_loc("持倉損益")] = f"color:{down}"
-            if ch.startswith("▲"):
+            if ch.endswith("漲停") or ch.endswith("跌停"):     # 漲停紅底、跌停綠底
+                bg = "#d1352b" if ch.endswith("漲停") else "#14825a"
+                for k in ("現價", "漲跌"):
+                    styles[row.index.get_loc(k)] = f"background-color:{bg};color:#fff;font-weight:700"
+            elif ch.startswith("▲"):
                 styles[row.index.get_loc("漲跌")] = f"color:{up}"
             elif ch.startswith("▼"):
                 styles[row.index.get_loc("漲跌")] = f"color:{down}"
-            if pd.notna(row["評分"]):
-                c2 = up if row["評分"] >= 3 else down if row["評分"] <= -3 else ""
-                styles[row.index.get_loc("判讀")] = f"color:{c2}" if c2 else ""
+            for k in ("明日漲機率", "10日漲機率"):
+                v = row[k]
+                if pd.notna(v):
+                    styles[row.index.get_loc(k)] = f"color:{up}" if v >= 56 else f"color:{down}" if v <= 44 else ""
             if "⚠" in row["狀態"]:
                 styles[row.index.get_loc("狀態")] = "color:#b7791f"
             return styles
@@ -402,7 +467,8 @@ if st.session_state.nav == HOME:
                      key="fav_table", on_select=on_table_select, selection_mode="single-row",
                      column_config={"現價": st.column_config.NumberColumn(format="%.2f"),
                                     "停損參考": st.column_config.NumberColumn(format="%.2f"),
-                                    "評分": st.column_config.NumberColumn(format="%+d")})
+                                    "明日漲機率": st.column_config.NumberColumn(format="%d%%"),
+                                    "10日漲機率": st.column_config.NumberColumn(format="%d%%")})
         st.caption("點選任一列左側的方框即可開啟該股分析。"
                    + (f" 盤中每 {LIVE_EVERY} 秒自動更新報價。" if any_open else ""))
 
@@ -447,12 +513,18 @@ def pct_table(df: pd.DataFrame, key: str, tw_colors: bool, cols: dict, height: i
     up, down = ("#d1352b", "#14825a") if tw_colors else ("#14825a", "#d1352b")
     pct_col = cols.get("pct")
 
+    lim = [("up" if v >= 0.095 else "down" if v <= -0.095 else "") if tw_colors else "" for v in df["pct"]]
+
     def style(col):
+        if col.name == "收盤":
+            return [f"background-color:{'#d1352b' if l == 'up' else '#14825a'};color:#fff;font-weight:700" if l else ""
+                    for l in lim]
         if col.name != pct_col:
             return [""] * len(col)
-        return [f"color:{up}" if v > 0 else f"color:{down}" if v < 0 else "" for v in col]
+        return [(f"background-color:{'#d1352b' if l == 'up' else '#14825a'};color:#fff;font-weight:700" if l else
+                 f"color:{up}" if v > 0 else f"color:{down}" if v < 0 else "") for v, l in zip(col, lim)]
 
-    fmt = {pct_col: lambda v: f"{v * 100:+.2f}%"} if pct_col else {}
+    fmt = {pct_col: lambda v: f"{v * 100:+.2f}%" + (" 漲停" if tw_colors and v >= 0.095 else " 跌停" if tw_colors and v <= -0.095 else "")} if pct_col else {}
     if "成交金額(億)" in show:
         show["成交金額(億)"] = show["成交金額(億)"] / 1e8
         fmt["成交金額(億)"] = "{:,.1f}"
@@ -541,6 +613,23 @@ if st.session_state.nav == RECAP:
                 metric(m[5], "融資餘額", f"{mg['balance']:,.0f} 億元", f"{mg['chg']:+,.1f} 億",
                        delta_color="off", border=True)
 
+            try:
+                Pi = get_prob("^TWII", 730, token)
+            except Exception:
+                Pi = None
+            if Pi and Pi["next"].get("gap_mu") is not None:
+                g = Pi["next"]
+                gc = "#d1352b" if g["gap_mu"] > 0 else "#14825a"
+                st.markdown(
+                    f"<div class='live'><div class='small'>🌙 下一個交易日加權指數預估（{g['gap_src']}）</div>"
+                    f"<div class='row'><span class='px' style='color:{gc}'>開盤 {g['gap_mu'] * 100:+.2f}%</span>"
+                    f"<span>上漲機率 <b style='color:#d1352b'>{g['p_up'] * 100:.0f}%</b>　下跌機率 "
+                    f"<b style='color:#14825a'>{(1 - g['p_up']) * 100:.0f}%</b></span>"
+                    f"<span class='small'>常見範圍 {(g['gap_mu'] - g['gap_sd']) * 100:+.1f}% ～ "
+                    f"{(g['gap_mu'] + g['gap_sd']) * 100:+.1f}%</span></div></div>", unsafe_allow_html=True)
+                tr = {**tr, "summary": tr["summary"] + [
+                    f"依{g['gap_src']}推估，下一個交易日加權指數開盤約 {g['gap_mu'] * 100:+.2f}%，"
+                    f"當日上漲機率 {g['p_up'] * 100:.0f}%。"]}
             st.markdown("##### 重點摘要")
             st.markdown("\n".join(f"- {x}" for x in tr["summary"]))
             ai_recap_button("台股", tr["summary"], "ai_tw")
@@ -598,6 +687,11 @@ if st.session_state.nav == RECAP:
                           f"ADR {ad['tsm']:,.2f} 美元 × 匯率 {ad['fx']:.2f} ÷ 5 = {ad['tsm'] * ad['fx'] / 5:,.0f} 元",
                           delta_color="off", delta_arrow="off", border=True)
 
+            ov = get_ov()
+            if ov.get("nq") is not None:
+                nc = "#14825a" if ov["nq"] > 0 else "#d1352b"
+                st.markdown(f"<div class='small'>🌙 那斯達克期貨目前 <b style='color:{nc}'>{ov['nq'] * 100:+.2f}%</b>"
+                            "（下一個美股交易日方向參考）</div>", unsafe_allow_html=True)
             st.markdown("##### 重點摘要")
             st.markdown("\n".join(f"- {x}" for x in ur["summary"]))
             ai_recap_button("美股", ur["summary"], "ai_us")
@@ -645,6 +739,13 @@ except engine.DataError as e:
     st.error(str(e))
     st.stop()
 
+try:
+    with st.spinner("計算上漲／下跌機率中（技術、籌碼、營收、新聞、隔夜美股）…"):
+        P = get_prob(code, days, token)
+except Exception as e:
+    P = None
+    st.warning(f"機率計算失敗：{e}")
+r = with_prob(r, P)
 up_c, down_c = colors(market, code)
 SESSION = live.session_of(code, market)
 df, last = r["df"], r["last"]
@@ -682,7 +783,7 @@ def live_card():
     st.markdown(
         f"<div class='live'><div class='small'><span class='dot' style='background:{dot}'></span>"
         f"{'盤中即時' if opened else '最新報價'}｜{q['source']} {q['time']}</div>"
-        f"<div class='row'><span class='px' style='color:{chg_col}'>{q['price']:,.2f}</span>"
+        f"<div class='row'><span class='px'>{price_html(q['price'], live.limit_state(q['price'], q.get('prev'), market, q), chg_col)}</span>"
         f"<span style='color:{chg_col};font-weight:600'>{fmt_chg(q['chg'])}</span>"
         f"<span class='small'>{hl}</span><span class='small'>{'　'.join(notes)}</span></div></div>",
         unsafe_allow_html=True)
@@ -699,34 +800,61 @@ def card(col, lbl, val, sub="", color="inherit", sub_color="gray"):
 c1, c2, c3, c4, c5 = st.columns([1, 1.3, 1.2, 1, 1])
 chg_c = up_c if r["chg"] > 0 else down_c if r["chg"] < 0 else "gray"
 card(c1, "收盤價（分析基準）", f"{r['close']:,.2f}", f"{r['chg'] * 100:+.2f}%（{cur}）", sub_color=chg_c)
-tone_color = {"up": up_c, "down": down_c, "flat": "inherit"}[r["tone"]]
-card(c2, f"綜合評分（±{r['n_parts']}）",
-     f"{r['score']:+d}　<span style='font-size:1.05rem'>{r['verdict']}</span>", color=tone_color)
+def prob_card(col, title, h):
+    if not h:
+        card(col, title, "—", "資料不足")
+        return
+    pu = h["p_up"]
+    col.markdown(
+        f"<div class='card'><div class='lbl'>{title}</div>"
+        f"<div class='val' style='font-size:1.3rem;white-space:nowrap'><span style='color:{up_c}'>漲 {pu * 100:.0f}%</span>"
+        f"<span style='font-size:.9rem;color:gray'> ｜ </span>"
+        f"<span style='color:{down_c}'>跌 {(1 - pu) * 100:.0f}%</span></div>"
+        f"<div style='display:flex;height:6px;border-radius:3px;overflow:hidden;margin:4px 0'>"
+        f"<div style='width:{pu * 100:.0f}%;background:{up_c}'></div>"
+        f"<div style='width:{(1 - pu) * 100:.0f}%;background:{down_c}'></div></div>"
+        f"<div class='sub'>起點 {h['base'] * 100:.0f}%，依下方機率表加減</div></div>", unsafe_allow_html=True)
+
+
+prob_card(c2, "下一個交易日", P["next"] if P else None)
 d = r["d10"]
 card(c3, "10 日預估區間（80%）",
      f"<span style='color:{down_c}'>{d['p10'] * 100:+.1f}%</span> ~ <span style='color:{up_c}'>{d['p90'] * 100:+.1f}%</span>",
      f"中位數 {d['p50'] * 100:+.1f}%")
 card(c4, "停損參考", f"{r['stop']:,.2f}", f"跌破代表超出悲觀預估（{d['p10'] * 100:+.1f}%）")
-ml = r["ml"]
-if r["prob"] is None or ml["acc"] is None:
-    card(c5, "模型上漲機率", "—", "樣本不足")
-else:
-    card(c5, "模型上漲機率", f"{r['prob'] * 100:.0f}%",
-         "已通過驗證" if ml["passed"] else "未通過驗證，僅供參考",
-         sub_color="#14825a" if ml["passed"] else "#b7791f")
+prob_card(c5, "未來 10 個交易日", P["h10"] if P else None)
 
-chips = "".join(
-    f"<span class='chip' style='color:{up_c if v > 0 else down_c}'>{'＋' if v > 0 else '－'} {engine.label(k, v)}</span>"
-    for k, v in r["parts"].items())
-st.markdown(chips, unsafe_allow_html=True)
+if P and P["next"].get("gap_mu") is not None:
+    g = P["next"]
+    gc = up_c if g["gap_mu"] > 0 else down_c
+    st.markdown(f"<div class='small'>🌙 明日開盤預估（{g['gap_src']}）："
+                f"<b style='color:{gc}'>{g['gap_mu'] * 100:+.2f}%</b>，約 {r['close'] * (1 + g['gap_mu']):,.2f}"
+                f"（常見範圍 {(g['gap_mu'] - g['gap_sd']) * 100:+.1f}% ～ {(g['gap_mu'] + g['gap_sd']) * 100:+.1f}%）</div>",
+                unsafe_allow_html=True)
 
 st.markdown("#### AI 解讀")
-st.markdown(f"<div class='ai'>{r['explain']}</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='ai'>{P['summary'] if P else r['explain']}</div>", unsafe_allow_html=True)
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_news(code: str, market: str, name: str):
-    return news.fetch(code, market, name)
+if P:
+    with st.expander("📊 機率表：每個因素加減了多少", expanded=False):
+        def show_prob_table(h, key):
+            t = prob.table(h)
 
+            def sty(col):
+                if col.name != "影響（百分點）":
+                    return [""] * len(col)
+                return [f"color:{up_c}" if v > 0.05 else f"color:{down_c}" if v < -0.05 else "color:gray" for v in col]
+
+            st.dataframe(t.style.apply(sty).format({"影響（百分點）": lambda v: "" if pd.isna(v) else f"{v:+.1f}"}),
+                         hide_index=True, width="stretch", key=key)
+        pt1, pt2 = st.tabs(["下一個交易日", "未來 10 個交易日"])
+        with pt1:
+            show_prob_table(P["next"], "pt_next")
+        with pt2:
+            show_prob_table(P["h10"], "pt_h10")
+        st.caption("技術與籌碼條件用這檔股票自己的歷史統計，依樣本數打折，總和再打五折（因為條件彼此相關）；"
+                   "營收、新聞用固定的小權重；台股明日開盤用過去兩年「前一晚美股 → 台股開盤跳空」的迴歸。"
+                   "機率限制在 20%～80%，因為短期漲跌本來就很難預測。這是統計上的傾向，不是保證。")
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_ai_summary(key: str, label: str, titles: tuple):
@@ -953,6 +1081,7 @@ with tab_bt:
              "上漲機率": "—" if pd.isna(x["win"]) else f"{x['win'] * 100:.0f}%"}
             for x in reversed(r["by_bucket"])]), hide_index=True, width="stretch")
 
+    ml = r["ml"]
     if ml["acc"] is not None:
         verdict = "通過" if ml["passed"] else "未通過"
         st.markdown(f"**機器學習模型（邏輯迴歸，滾動式訓練）**：樣本外 {ml['n']} 天，準確率 {ml['acc'] * 100:.0f}%，"
@@ -961,11 +1090,18 @@ with tab_bt:
 
 with tab_about:
     st.markdown(f"""
-**評分怎麼算**：每個條件成立 +1、不成立 -1，加總為綜合評分。目前使用 {r['n_parts']} 項：{"、".join(r["parts"])}。
+**上漲／下跌機率怎麼算**：起點是這檔股票歷史上「隔天上漲」與「10 天後上漲」的比例，再依下列因素加減，每一項加減多少都列在「📊 機率表」裡：
+- 技術與籌碼（均線、RSI、量能、外資／投信買賣超、融資）：用這檔股票自己的歷史統計，樣本少就打折，總和再打五折
+- 營收（台股）：最新月營收年增率、成長是否加速
+- 新聞：近 2 天／7 天標題的利多利空數，風險類新聞扣分
+- 隔夜美股（台股明日）：前一晚那斯達克與費半漲跌，用過去兩年的資料推算台股開盤跳空，再乘上個股相對大盤的敏感度
+- 機率限制在 20%～80%。收盤後會持續抓新聞與美股，明日的機率會跟著更新
+
+**回測分頁的「評分策略」**：舊版的技術評分（每個條件 +1／−1 加總），保留在回測頁做參考。
 
 **台股 vs 美股**：台股有每日三大法人與融資資料，用來代表籌碼；美股沒有每日法人資料，改用 OBV 量能、RSI 與相對大盤強弱。顏色也依各市場慣例：台股紅漲綠跌、美股綠漲紅跌。
 
-**預估扇形**：用近 60 日每日波動度推算機率區間，並把這個評分在歷史上的平均表現打五折當作方向偏移。不考慮除權息、財報與重大新聞。
+**預估扇形**：用近 60 日每日波動度推算機率區間，並把技術評分在歷史上的平均表現打五折當作方向偏移。
 
 **模型驗證**：模型只用「當時已知」的資料訓練，再預測下一段時間，避免偷看未來。準確率要比「永遠猜多數方向」高 3 個百分點以上，且樣本至少 150 天，才算通過。
 

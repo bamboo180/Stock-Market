@@ -83,6 +83,7 @@ def quotes_mis(ex_ch: list[str]) -> dict[str, dict]:
             "chg": (price / prev - 1) if prev else None,
             "open": _num(m.get("o")), "high": _num(m.get("h")), "low": _num(m.get("l")),
             "vol": _num(m.get("v")),                       # 張
+            "limit_up": _num(m.get("u")), "limit_down": _num(m.get("w")),
             "date": m.get("d", ""), "time": m.get("t") or m.get("%", ""),
             "name": m.get("n", ""), "source": "證交所",
         }
@@ -137,3 +138,19 @@ def quotes(codes: list[str], market_of) -> dict[str, dict]:
         if q:
             out[c] = q
     return out
+
+
+def limit_state(price: float | None, prev: float | None, market: str, q: dict | None = None) -> str:
+    """台股漲停／跌停判斷：有即時漲跌停價就用，沒有就用漲跌幅 ±9.5% 近似。回傳 "up"、"down" 或 ""。"""
+    if market != "TW" or not price:
+        return ""
+    if q and q.get("limit_up") and price >= q["limit_up"] - 1e-9:
+        return "up"
+    if q and q.get("limit_down") and price <= q["limit_down"] + 1e-9:
+        return "down"
+    if q and q.get("limit_up"):
+        return ""
+    if prev:
+        ch = price / prev - 1
+        return "up" if ch >= 0.095 else "down" if ch <= -0.095 else ""
+    return ""
