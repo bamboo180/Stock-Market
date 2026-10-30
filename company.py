@@ -32,17 +32,24 @@ def _num(x):
 
 
 def _roc(d: str) -> str:
-    """民國日期 0760221 / 760221 → 1987-02-21"""
+    """日期統一成西元：19870221（西元）、0760221／760221（民國）、1987/02/21 都轉成 1987-02-21"""
     d = re.sub(r"\D", "", str(d or ""))
-    if len(d) < 6:
+    if len(d) == 8 and d[:2] in ("19", "20"):       # 已經是西元年
+        y = int(d[:4])
+    elif 6 <= len(d) <= 7:                           # 民國年
+        y = int(d[:-4]) + 1911
+    else:
         return ""
-    return f"{int(d[:-4]) + 1911}-{d[-4:-2]}-{d[-2:]}"
+    m, day = int(d[-4:-2]), int(d[-2:])
+    if not (1900 < y < 2100 and 1 <= m <= 12 and 1 <= day <= 31):
+        return ""
+    return f"{y}-{m:02d}-{day:02d}"
 
 
 # ----------------------------------------------------------------------------
 # 維基百科
 # ----------------------------------------------------------------------------
-def wiki(query: str, must_contain: list[str]) -> dict | None:
+def wiki(query: str, must_contain: list[str], also_need: list[str] | None = None) -> dict | None:
     """搜尋中文維基百科，只接受摘要裡真的提到這家公司的條目（避免抓到董事長或同名條目）。"""
     api = "https://zh.wikipedia.org/w/api.php"
     try:
@@ -52,9 +59,10 @@ def wiki(query: str, must_contain: list[str]) -> dict | None:
         return None
     keys = [k.lower() for k in must_contain if k]
     # 先看條目標題是不是公司名稱，再看摘要開頭（避免抓到董事長、產品等相關條目）
-    ranked = sorted(hits, key=lambda h: 0 if any(k in h["title"].lower() or h["title"].lower() in k for k in keys) else 1)
+    need = [n.lower() for n in (also_need or []) if n]
+    ranked = sorted(hits, key=lambda h: 0 if any(k in h["title"].lower() for k in keys) else 1)
     for h in ranked:
-        title_ok = any(k in h["title"].lower() or h["title"].lower() in k for k in keys)
+        title_ok = any(k in h["title"].lower() for k in keys)
         try:
             ex = requests.get(api, params={"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
                                            "redirects": 1, "variant": "zh-tw", "format": "json", "titles": h["title"]},
@@ -65,6 +73,8 @@ def wiki(query: str, must_contain: list[str]) -> dict | None:
         text = (page.get("extract") or "").strip()
         start = text[:12].lower()
         if not text or "消歧義" in text[:60] or not (title_ok or any(k[:4] in start for k in keys)):
+            continue
+        if need and not any(n in text[:300].lower() for n in need):      # 例如美股要提到英文名或代號
             continue
         paras = [p for p in text.split("\n") if p.strip()]
         summary = paras[0]
@@ -161,37 +171,131 @@ def _quarter(d) -> str:
 # ----------------------------------------------------------------------------
 # 美股
 # ----------------------------------------------------------------------------
-def us(code: str, cname: str = "") -> dict:
-    info: dict = {"rows": [], "valuation": [], "summary_en": "", "wiki": None}
+SEC_UA = {"User-Agent": "StockSignalApp/1.8 personal-research research-tool@example.com"}
+
+
+def _sec_cik(code: str) -> int | None:
     try:
-        import yfinance as yf
-        i = yf.Ticker(code).info or {}
+        j = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_UA, timeout=15).json()
     except Exception:
-        i = {}
+        return None
+    code = code.upper().replace("-", ".")
+    for v in j.values():
+        if v["ticker"].upper().replace("-", ".") == code:
+            return int(v["cik_str"])
+    return None
+
+
+def sec(code: str) -> dict:
+    """美國證管會（SEC）官方資料：公司名稱、產業、總部、流通股數、每季 EPS、營收、毛利率。"""
+    out: dict = {}
+    cik = _sec_cik(code)
+    if not cik:
+        return out
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(2) as ex:
+        f_sub = ex.submit(requests.get, f"https://data.sec.gov/submissions/CIK{cik:010d}.json", headers=SEC_UA, timeout=15)
+        f_fac = ex.submit(requests.get, f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json", headers=SEC_UA, timeout=20)
+    try:
+        sub = f_sub.result().json()
+        a = (sub.get("addresses") or {}).get("business") or {}
+        out.update(name=sub.get("name", ""), industry=sub.get("sicDescription", ""),
+                   exchange="、".join(sub.get("exchanges") or []),
+                   hq=", ".join(x for x in [(a.get("city") or "").title(), a.get("stateOrCountryDescription")] if x),
+                   website=sub.get("website") or "")
+    except Exception:
+        pass
+    try:
+        facts = f_fac.result().json().get("facts", {})
+    except Exception:
+        return out
+    gaap = facts.get("us-gaap", {})
+
+    def quarterly(*tags, unit="USD"):
+        """取單季數字（SEC 的 frame 格式 CY2026Q2，且期間約 3 個月）。"""
+        for t in tags:
+            rows = (gaap.get(t, {}).get("units", {}) or {}).get(unit, [])
+            q = {}
+            for r in rows:
+                fr = r.get("frame", "")
+                if re.fullmatch(r"CY\d{4}Q\d", fr) and r.get("start") and r.get("end"):
+                    days = (pd.Timestamp(r["end"]) - pd.Timestamp(r["start"])).days
+                    if 80 <= days <= 100:
+                        q[fr] = r["val"]
+            if q:
+                return pd.Series(q).sort_index()
+        return pd.Series(dtype=float)
+
+    eps = quarterly("EarningsPerShareDiluted", "EarningsPerShareBasic", unit="USD/shares")
+    rev = quarterly("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet")
+    gp = quarterly("GrossProfit")
+    oi = quarterly("OperatingIncomeLoss")
+    ni = quarterly("NetIncomeLoss")
+    if len(eps):
+        e = eps.tail(8)
+        out["eps"] = pd.DataFrame({"季度": [f[2:] for f in e.index], "EPS（美元）": e.values})
+        if len(eps) >= 4:
+            out["eps_ttm"] = float(eps.tail(4).sum())
+    if len(rev):
+        last = rev.index[-1]
+        m = {"季度": last[2:], "營收": rev.iloc[-1]}
+        for k, s_ in (("毛利率", gp), ("營益率", oi), ("淨利率", ni)):
+            if last in s_.index and rev.iloc[-1]:
+                m[k] = s_[last] / rev.iloc[-1]
+        out["margin"] = m
+    sh = (facts.get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}) or {}).get("shares", [])
+    if sh:
+        out["shares"] = float(sorted(sh, key=lambda r: r["end"])[-1]["val"])
+    return out
+
+
+def us(code: str, cname: str = "") -> dict:
+    """cname 例如「超微 Advanced Micro Devices」：中文名＋英文名。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def yahoo():
+        try:
+            import yfinance as yf
+            return yf.Ticker(code).info or {}
+        except Exception:          # Yahoo 常限制次數，失敗就只用 SEC 資料
+            return {}
+
+    zh = cname.split()[0] if cname and not cname.split()[0].isascii() else ""
+    en = " ".join(cname.split()[1:]) if zh else cname
+    with ThreadPoolExecutor(3) as ex:
+        f_y, f_sec = ex.submit(yahoo), ex.submit(sec, code)
+        i, sc = f_y.result(), f_sec.result()
 
     def money(v):
         return f"{v / 1e9:,.1f} 十億美元" if v else ""
 
-    rows = [("公司全名", i.get("longName", "")), ("產業", " / ".join(x for x in [i.get("sector"), i.get("industry")] if x)),
+    rows = [("公司全名", i.get("longName") or sc.get("name", "")),
+            ("產業", " / ".join(x for x in [i.get("sector"), i.get("industry")] if x) or sc.get("industry", "")),
+            ("交易所", sc.get("exchange", "")),
             ("員工數", f"{i['fullTimeEmployees']:,}" if i.get("fullTimeEmployees") else ""),
-            ("總部", ", ".join(x for x in [i.get("city"), i.get("country")] if x)),
-            ("市值", money(i.get("marketCap"))), ("網址", i.get("website", ""))]
-    info["rows"] = [(k, v) for k, v in rows if v]
+            ("總部", ", ".join(x for x in [i.get("city"), i.get("country")] if x) or sc.get("hq", "")),
+            ("市值", money(i.get("marketCap"))), ("網址", i.get("website") or sc.get("website", ""))]
+    info: dict = {"rows": [(k, v) for k, v in rows if v], "summary_en": i.get("longBusinessSummary", ""), "wiki": None,
+                  "eps": sc.get("eps"), "eps_ttm": sc.get("eps_ttm"), "margin": sc.get("margin"),
+                  "us_shares": None if i.get("marketCap") else sc.get("shares"), "yahoo_ok": bool(i)}
     val = [("本益比（近 4 季）", f"{i['trailingPE']:.1f} 倍" if i.get("trailingPE") else ""),
            ("預估本益比", f"{i['forwardPE']:.1f} 倍" if i.get("forwardPE") else ""),
-           ("EPS（近 4 季）", f"{i['trailingEps']:.2f} 美元" if i.get("trailingEps") else ""),
+           ("EPS（近 4 季）", f"{i['trailingEps']:.2f} 美元" if i.get("trailingEps")
+            else (f"{sc['eps_ttm']:.2f} 美元（SEC）" if sc.get("eps_ttm") else "")),
            ("殖利率", f"{i['dividendYield']:.2f}%" if i.get("dividendYield") else ""),
            ("股價淨值比", f"{i['priceToBook']:.2f} 倍" if i.get("priceToBook") else ""),
-           ("毛利率", f"{i['grossMargins'] * 100:.1f}%" if i.get("grossMargins") else ""),
-           ("營益率", f"{i['operatingMargins'] * 100:.1f}%" if i.get("operatingMargins") else ""),
            ("52 週區間", f"{i['fiftyTwoWeekLow']:,.2f} ～ {i['fiftyTwoWeekHigh']:,.2f}"
             if i.get("fiftyTwoWeekLow") and i.get("fiftyTwoWeekHigh") else ""),
            ("Beta", f"{i['beta']:.2f}" if i.get("beta") else "")]
     info["valuation"] = [(k, v) for k, v in val if v]
-    info["summary_en"] = i.get("longBusinessSummary", "")
-    long_name = i.get("longName") or i.get("shortName") or ""
-    keys = [k for k in {cname.split()[0] if cname else "", long_name.split(",")[0].replace(" Inc.", ""), code} if k]
-    q = cname.split()[0] if cname else long_name
-    if q:
-        info["wiki"] = wiki(f"{q} 公司", keys)
+    if not info["margin"] and i.get("grossMargins"):
+        info["margin"] = {"季度": "近 4 季", "毛利率": i.get("grossMargins"), "營益率": i.get("operatingMargins"),
+                          "淨利率": i.get("profitMargins")}
+
+    long_name = i.get("longName") or sc.get("name", "") or en
+    first_en = re.split(r"[ ,.]", long_name.strip())[0] if long_name else ""
+    if zh:
+        # 標題要含中文名，內文前段要提到英文名或代號，避免抓到同名條目（例如「蘋果」水果、「超微」對到美超微）
+        en_first = re.split(r"[ ,.]", en.strip())[0] if en else ""
+        info["wiki"] = wiki(f"{zh} 公司", [zh], also_need=[first_en, en_first, code])
     return info

@@ -26,7 +26,7 @@ import recap
 import store
 import symbols
 
-APP_VERSION = "v1.8（2026-10-30）"
+APP_VERSION = "v1.9（2026-10-30）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -1091,12 +1091,17 @@ def company_panel():
         st.markdown(f"<div style='line-height:1.75'>{w['text']}</div>"
                     f"<div class='small'>來源：<a href='{w['url']}' target='_blank'>維基百科「{w['title']}」</a></div>",
                     unsafe_allow_html=True)
-    elif ci.get("summary_en"):
-        st.markdown(f"<div style='line-height:1.6;font-size:.92rem'>{ci['summary_en'][:700]}"
-                    f"{'…' if len(ci['summary_en']) > 700 else ''}</div><div class='small'>來源：Yahoo Finance</div>",
-                    unsafe_allow_html=True)
-    else:
+    if ci.get("summary_en"):
+        if w:
+            with st.expander("英文完整公司介紹（Yahoo Finance）"):
+                st.markdown(ci["summary_en"])
+        else:
+            st.markdown(f"<div style='line-height:1.6;font-size:.92rem'>{ci['summary_en']}</div>"
+                        "<div class='small'>來源：Yahoo Finance</div>", unsafe_allow_html=True)
+    if not w and not ci.get("summary_en"):
         st.caption("找不到公司簡介。")
+    if market == "US" and not ci.get("yahoo_ok"):
+        st.caption("Yahoo 的公司資料暫時取不到（Yahoo 常限制連線次數），以下改用美國證管會（SEC）的官方申報資料。")
     ai_key = secret("ANTHROPIC_API_KEY")
     if ai_key and (ci.get("summary_en") or w):
         if st.button("✨ 請 Claude 用白話說明這家公司在做什麼", key=f"co_ai_{code}", width="stretch"):
@@ -1112,9 +1117,14 @@ def company_panel():
             st.info(st.session_state[f"co_ai_txt_{code}"])
 
     rows = list(ci.get("rows", []))
+    pos = -1 if rows and rows[-1][0] == "網址" else len(rows)
     if ci.get("shares"):
-        rows.insert(-1 if rows and rows[-1][0] == "網址" else len(rows),
-                    ("市值（現價估算）", f"{ci['shares'] * float(r['close']) / 1e8:,.0f} 億元"))
+        rows.insert(pos, ("市值（現價估算）", f"{ci['shares'] * float(r['close']) / 1e8:,.0f} 億元"))
+    elif ci.get("us_shares"):
+        rows.insert(pos, ("市值（現價估算）", f"{ci['us_shares'] * float(r['close']) / 1e9:,.1f} 十億美元"))
+    if market == "US" and ci.get("eps_ttm") and ci["eps_ttm"] > 0 and not any("本益比" in k for k, _ in ci.get("valuation", [])):
+        ci = {**ci, "valuation": [("本益比（近 4 季，SEC EPS 計算）", f"{float(r['close']) / ci['eps_ttm']:.1f} 倍")]
+              + list(ci.get("valuation", []))}
     if rows:
         st.markdown("**基本資料**")
         st.markdown(kv_html(rows), unsafe_allow_html=True)
@@ -1126,18 +1136,23 @@ def company_panel():
         st.markdown(f"**獲利能力（{m['季度']}）**")
         st.markdown(kv_html([(k, f"{m[k] * 100:.1f}%") for k in ("毛利率", "營益率", "淨利率") if pd.notna(m.get(k))]),
                     unsafe_allow_html=True)
+    if m and m.get("營收"):
+        st.caption(f"單季營收 {m['營收'] / 1e9:,.2f} 十億美元")
     if ci.get("eps") is not None and len(ci["eps"]):
         e = ci["eps"]
-        st.markdown("**每季 EPS（元）**" + (f"　近 4 季合計 {ci['eps_ttm']:.2f}" if ci.get("eps_ttm") else ""))
-        fig = go.Figure(go.Bar(x=e["季度"], y=e["EPS（元）"], text=[f"{v:.2f}" for v in e["EPS（元）"]],
+        ecol = [c for c in e.columns if c.startswith("EPS")][0]
+        unit = "美元" if "美元" in ecol else "元"
+        st.markdown(f"**每季 EPS（{unit}）**" + (f"　近 4 季合計 {ci['eps_ttm']:.2f}" if ci.get("eps_ttm") else ""))
+        fig = go.Figure(go.Bar(x=e["季度"], y=e[ecol], text=[f"{v:.2f}" for v in e[ecol]],
                                textposition="outside", cliponaxis=False,
-                               marker_color=[up_c if v >= 0 else down_c for v in e["EPS（元）"]]))
+                               marker_color=[up_c if v >= 0 else down_c for v in e[ecol]]))
         fig.update_layout(height=200, margin=dict(l=0, r=0, t=16, b=0), yaxis=dict(visible=False), dragmode=False)
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=f"eps_{code}")
     if ci.get("dividends") is not None and len(ci["dividends"]):
         st.markdown("**近期股利（元）**")
         st.dataframe(ci["dividends"], hide_index=True, width="stretch")
-    st.caption("資料：證交所／櫃買中心公司基本資料、FinMind、維基百科" if market == "TW" else "資料：Yahoo Finance、維基百科")
+    st.caption("資料：證交所／櫃買中心公司基本資料、FinMind、維基百科" if market == "TW"
+               else "資料：Yahoo Finance、美國證管會 SEC（EPS、營收、毛利率）、維基百科")
 
 
 with side:
