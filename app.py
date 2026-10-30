@@ -23,10 +23,11 @@ import news
 import position
 import prob
 import recap
+import session
 import store
 import symbols
 
-APP_VERSION = "v1.9（2026-10-30）"
+APP_VERSION = "v2.0（2026-10-30）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -100,6 +101,7 @@ if APP_PASSWORD and not st.session_state.get("authed"):
     st.stop()
 
 SAVED_TOKEN = secret("FINMIND_TOKEN")
+company.set_sec_contact(secret("SEC_CONTACT"))
 PERIODS = {"1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825}
 LIVE_EVERY = 60          # 盤中即時報價更新秒數
 VIEWS = ["📈 市場總覽", "📰 盤後整理", "🔍 個股分析"]
@@ -256,6 +258,22 @@ def price_html(price: float, state: str, color: str, size: str = "") -> str:
         return (f"<span class='lim lim-{state}' style='{size}'>{txt}</span>"
                 f"<span class='lim-tag lim-{state}'>{'漲停' if state == 'up' else '跌停'}</span>")
     return f"<span style='color:{color};{size}'>{txt}</span>"
+
+
+def kv_html(rows) -> str:
+    out = []
+    for k, v in rows:
+        v = str(v)
+        val = f"<a href='{v}' target='_blank'>{v}</a>" if v.startswith("http") else v
+        out.append("<div style='display:flex;gap:10px;padding:3px 0;border-bottom:1px dashed rgba(128,128,128,.2)'>"
+                   f"<span class='small' style='min-width:6.5em'>{k}</span>"
+                   f"<span style='word-break:break-all'>{val}</span></div>")
+    return "".join(out)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_intraday(code: str, market: str):
+    return session.intraday(code, market)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -838,6 +856,9 @@ F_NEWS = bg(get_news, code, _mk, news_name(code))
 F_PROB = bg(get_prob, code, days, token)
 F_CO = bg(get_company, code, _mk, news_name(code), token or "") if _mk in ("TW", "US") else None
 F_Q = bg(get_quotes, (code,))
+F_INTRA = bg(get_intraday, code, _mk) if _mk != "IDX" or code in ("^TWII", "^GSPC", "^IXIC", "^DJI", "^SOX") else None
+IDX_REF = {"TW": "^TWII", "US": "^GSPC"}.get(_mk)
+F_IDXQ = bg(get_quotes, (IDX_REF,)) if IDX_REF else None
 try:
     with st.spinner(f"抓取 {code} 資料中…"):
         market, name, r = F_AN.result()
@@ -939,6 +960,85 @@ if P and P["next"].get("gap_mu") is not None:
 
 st.markdown("#### AI 解讀")
 st.markdown(f"<div class='ai'>{P['summary'] if P else r['explain']}</div>", unsafe_allow_html=True)
+
+
+# --- 🕒 盤前／盤中／盤後整理 ---
+@st.fragment(run_every=LIVE_EVERY if live.is_open(SESSION) else None)
+def session_box():
+    q = get_quotes((code,)).get(code)
+    try:
+        intra = get_intraday(code, market) if market != "IDX" or code in ("^TWII", "^GSPC") else None
+    except Exception:
+        intra = None
+    idx_q = get_quotes((IDX_REF,)).get(IDX_REF) if IDX_REF else None
+    try:
+        items_s = wait(F_NEWS, [])
+    except Exception:
+        items_s = []
+    b = session.build(code, market, SESSION, r, q, P, items_s, get_ov(), idx_q, STOP_REF, STOP_LABEL, intra)
+    ph = b["phase"]
+    names = {k: session.PHASE_NAME[k] + ("　● 現在" if k == ph else "") for k in ("pre", "live", "post")}
+    labels = [names["pre"], names["live"], names["post"]]
+    kw = {"default": names[ph]} if "default" in inspect.signature(st.tabs).parameters else {}
+    t_pre, t_live, t_post = st.tabs(labels, **kw)
+
+    def lines(sec):
+        st.markdown("\n".join(f"- {x}" for x in sec["lines"]))
+
+    def metric_row(sec):
+        if sec.get("metrics"):
+            cols = st.columns(len(sec["metrics"]))
+            for col, (lbl, val, sub) in zip(cols, sec["metrics"]):
+                card(col, lbl, val, sub)
+
+    with t_pre:
+        sec = b["pre"]
+        st.markdown(f"**{sec['title']}**")
+        lines(sec)
+        st.markdown(kv_html(sec["levels"]), unsafe_allow_html=True)
+    with t_live:
+        sec = b["live"]
+        st.markdown(f"**{sec['title']}**")
+        metric_row(sec)
+        lines(sec)
+        d = sec.get("intra")
+        if d is not None:
+            prev = float(r["df"]["close"].iloc[-2] if r["df"]["date"].iloc[-1].date() == live.now(SESSION).date()
+                         else r["df"]["close"].iloc[-1])
+            last_px = float(d["Close"].iloc[-1])
+            col = up_c if last_px >= prev else down_c
+            fig = go.Figure(go.Scatter(x=d["time"], y=d["Close"], mode="lines", line=dict(color=col, width=2),
+                                       fill="tozeroy", fillcolor="rgba(0,0,0,0)", name="5 分 K 收盤"))
+            fig.add_hline(y=prev, line_dash="dot", line_color="gray", annotation_text=f"昨收 {prev:,.2f}",
+                          annotation_position="bottom right")
+            lo, hi = float(d["Low"].min()), float(d["High"].max())
+            pad = (max(hi, prev) - min(lo, prev)) * 0.08 or 1
+            fig.update_layout(height=220, margin=dict(l=0, r=0, t=10, b=0), showlegend=False, dragmode=False,
+                              yaxis=dict(range=[min(lo, prev) - pad, max(hi, prev) + pad]))
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=f"intra_{code}")
+            st.caption("走勢為 Yahoo 5 分 K（台股約延遲 20 分鐘）" + ("，含美股盤前盤後" if market == "US" else ""))
+    with t_post:
+        sec = b["post"]
+        st.markdown(f"**{sec['title']}**")
+        metric_row(sec)
+        lines(sec)
+
+    ai_key = secret("ANTHROPIC_API_KEY")
+    if ai_key:
+        if st.button("✨ 請 Claude 把今日整理寫成一段話", key=f"sess_ai_{code}"):
+            try:
+                with st.spinner("Claude 撰寫中…"):
+                    st.session_state[f"sess_ai_txt_{code}"] = news.ask_claude(ai_key, (
+                        "請用繁體中文（台灣用語）、200 字內，把以下個股的盤前／盤中／盤後資料整理成一段給投資人看的短評，"
+                        "只根據資料，不要編造，不給買賣建議：\n" + session.as_text(code, name, b)))
+            except Exception as e:
+                st.warning(f"AI 失敗：{e}")
+        if st.session_state.get(f"sess_ai_txt_{code}"):
+            st.info(st.session_state[f"sess_ai_txt_{code}"])
+
+
+st.markdown("#### 🕒 今日整理（盤前／盤中／盤後）")
+session_box()
 
 if P:
     with st.expander("📊 機率表：每個因素加減了多少", expanded=False):
@@ -1065,17 +1165,6 @@ def is_dark() -> bool:
 
 main, side = st.columns([2.4, 1], gap="medium")
 
-def kv_html(rows) -> str:
-    out = []
-    for k, v in rows:
-        v = str(v)
-        val = f"<a href='{v}' target='_blank'>{v}</a>" if v.startswith("http") else v
-        out.append("<div style='display:flex;gap:10px;padding:3px 0;border-bottom:1px dashed rgba(128,128,128,.2)'>"
-                   f"<span class='small' style='min-width:6.5em'>{k}</span>"
-                   f"<span style='word-break:break-all'>{val}</span></div>")
-    return "".join(out)
-
-
 def company_panel():
     if market == "IDX":
         st.caption("指數沒有公司資料。")
@@ -1101,7 +1190,7 @@ def company_panel():
     if not w and not ci.get("summary_en"):
         st.caption("找不到公司簡介。")
     if market == "US" and not ci.get("yahoo_ok"):
-        st.caption("Yahoo 的公司資料暫時取不到（Yahoo 常限制連線次數），以下改用美國證管會（SEC）的官方申報資料。")
+        st.caption("Yahoo 的公司資料暫時取不到（Yahoo 常限制連線次數），以下改用其他來源。")
     ai_key = secret("ANTHROPIC_API_KEY")
     if ai_key and (ci.get("summary_en") or w):
         if st.button("✨ 請 Claude 用白話說明這家公司在做什麼", key=f"co_ai_{code}", width="stretch"):
@@ -1153,6 +1242,11 @@ def company_panel():
         st.dataframe(ci["dividends"], hide_index=True, width="stretch")
     st.caption("資料：證交所／櫃買中心公司基本資料、FinMind、維基百科" if market == "TW"
                else "資料：Yahoo Finance、美國證管會 SEC（EPS、營收、毛利率）、維基百科")
+    if ci.get("status"):
+        st.caption("資料來源狀態：" + "｜".join(f"{k} {v}" for k, v in ci["status"].items()))
+        if not any(v == "成功" for v in ci["status"].values()):
+            st.warning("美股資料來源都取不到。請先關掉黑色視窗，重新雙擊「啟動.bat」（會自動更新 yfinance 套件），"
+                       "仍不行的話把這段「資料來源狀態」截圖給我。")
 
 
 with side:

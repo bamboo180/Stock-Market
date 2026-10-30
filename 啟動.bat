@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo 股票訊號看板 v1.9
+echo 股票訊號看板 v2.0
 echo 關閉舊版（如果還在執行）...
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8501" ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 echo 檢查套件...
@@ -11,5 +11,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+echo 更新 yfinance（Yahoo 常改介面，舊版會抓不到美股資料）...
+python -m pip install -U yfinance --quiet
 python -m streamlit run app.py --server.port 8501
 pause
