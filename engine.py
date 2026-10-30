@@ -83,7 +83,20 @@ def tw_name(code: str, token: str | None = None) -> str:
 
 
 def fetch_tw(code: str, start: str, token: str | None = None) -> pd.DataFrame:
-    px = _finmind("TaiwanStockPrice", code, start, token)
+    # 價格、法人、融資三個請求同時送出，不用一個等一個
+    from concurrent.futures import ThreadPoolExecutor
+
+    def safe(ds):
+        try:
+            return _finmind(ds, code, start, token)
+        except DataError as e:
+            return e
+    with ThreadPoolExecutor(3) as ex:
+        f_px, f_inst, f_mg = (ex.submit(safe, ds) for ds in (
+            "TaiwanStockPrice", "TaiwanStockInstitutionalInvestorsBuySell", "TaiwanStockMarginPurchaseShortSale"))
+    px, inst_r, mg_r = f_px.result(), f_inst.result(), f_mg.result()
+    if isinstance(px, DataError):
+        raise px
     if px.empty:
         px = _fetch_tw_yf(code, start)
         if px.empty:
@@ -99,7 +112,7 @@ def fetch_tw(code: str, start: str, token: str | None = None) -> pd.DataFrame:
         })
 
     # 三大法人（張）
-    inst = _finmind("TaiwanStockInstitutionalInvestorsBuySell", code, start, token)
+    inst = inst_r if isinstance(inst_r, pd.DataFrame) else pd.DataFrame()
     if not inst.empty:
         inst["net"] = (inst["buy"] - inst["sell"]) / 1000
         grp = inst["name"].map(lambda n: "foreign" if n.startswith("Foreign")
@@ -111,7 +124,7 @@ def fetch_tw(code: str, start: str, token: str | None = None) -> pd.DataFrame:
         df = df.merge(piv, left_on="date", right_index=True, how="left")
 
     # 融資融券（張）
-    mg = _finmind("TaiwanStockMarginPurchaseShortSale", code, start, token)
+    mg = mg_r if isinstance(mg_r, pd.DataFrame) else pd.DataFrame()
     if not mg.empty:
         mg = pd.DataFrame({"date": pd.to_datetime(mg["date"]),
                            "margin": mg["MarginPurchaseTodayBalance"],

@@ -95,7 +95,7 @@ def tw_registry() -> dict[str, dict]:
     return out
 
 
-def tw(code: str, name: str, reg: dict[str, dict], price: float | None, token: str | None, group: str = "") -> dict:
+def tw(code: str, name: str, reg: dict[str, dict], token: str | None, group: str = "") -> dict:
     info: dict = {"rows": [], "valuation": [], "eps": None, "dividends": None, "wiki": None, "margin": None}
     r = reg.get(code, {})
     full = r.get("公司名稱") or r.get("CompanyName") or ""
@@ -106,20 +106,29 @@ def tw(code: str, name: str, reg: dict[str, dict], price: float | None, token: s
             ("成立日期", _roc(r.get("成立日期") or r.get("DateOfIncorporation"))),
             ("上市櫃日期", _roc(r.get("上市日期") or r.get("DateOfListing"))),
             ("實收資本額", f"{capital / 1e8:,.1f} 億元" if capital else ""),
-            ("市值（現價估算）", f"{shares * price / 1e8:,.0f} 億元" if shares and price else ""),
             ("網址", r.get("網址") or r.get("WebAddress") or "")]
     info["rows"] = [(k, v) for k, v in rows if v]
+    info["shares"] = shares
 
-    start = (pd.Timestamp.today() - pd.Timedelta(days=21)).strftime("%Y-%m-%d")
-    per = _fm("TaiwanStockPER", code, start, token)
+    from concurrent.futures import ThreadPoolExecutor
+    today = pd.Timestamp.today()
+    short = re.sub(r"(股份)?有限公司$", "", full) if full else name
+    keys = [k for k in {name, short, full} if k]
+    with ThreadPoolExecutor(5) as ex:            # 估值、財報、股利、維基百科同時抓
+        f_per = ex.submit(_fm, "TaiwanStockPER", code, (today - pd.Timedelta(days=21)).strftime("%Y-%m-%d"), token)
+        f_fin = ex.submit(_fm, "TaiwanStockFinancialStatements", code,
+                          (today - pd.Timedelta(days=760)).strftime("%Y-%m-%d"), token)
+        f_div = ex.submit(_fm, "TaiwanStockDividend", code, (today - pd.Timedelta(days=800)).strftime("%Y-%m-%d"), token)
+        f_wiki = ex.submit(wiki, f"{short or name} 公司", keys)
+        f_wiki2 = ex.submit(wiki, name, keys) if name else None
+    per = f_per.result()
     if not per.empty:
         p = per.iloc[-1]
         info["valuation"] = [("本益比", f"{p['PER']:.1f} 倍" if p["PER"] else "—（虧損或無資料）"),
                              ("殖利率", f"{p['dividend_yield']:.2f}%"), ("股價淨值比", f"{p['PBR']:.2f} 倍"),
                              ("資料日", p["date"])]
 
-    fin = _fm("TaiwanStockFinancialStatements", code,
-              (pd.Timestamp.today() - pd.Timedelta(days=760)).strftime("%Y-%m-%d"), token)
+    fin = f_fin.result()
     if not fin.empty:
         piv = fin.pivot_table(index="date", columns="type", values="value", aggfunc="last").sort_index()
         if "EPS" in piv:
@@ -133,16 +142,14 @@ def tw(code: str, name: str, reg: dict[str, dict], price: float | None, token: s
                               "營益率": last.get("OperatingIncome", float("nan")) / last["Revenue"],
                               "淨利率": last.get("IncomeAfterTaxes", float("nan")) / last["Revenue"]}
 
-    div = _fm("TaiwanStockDividend", code, (pd.Timestamp.today() - pd.Timedelta(days=800)).strftime("%Y-%m-%d"), token)
+    div = f_div.result()
     if not div.empty:
         d = div.tail(6).iloc[::-1]
         info["dividends"] = pd.DataFrame({
             "所屬期間": d["year"], "現金股利": d["CashEarningsDistribution"].round(2),
             "股票股利": d["StockEarningsDistribution"].round(2), "除息日": d["CashExDividendTradingDate"]})
 
-    short = re.sub(r"(股份)?有限公司$", "", full) if full else name
-    keys = [k for k in {name, short, full} if k]
-    info["wiki"] = wiki(f"{short or name} 公司", keys) or (wiki(name, keys) if name else None)
+    info["wiki"] = f_wiki.result() or (f_wiki2.result() if f_wiki2 else None)
     return info
 
 

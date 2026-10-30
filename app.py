@@ -1,7 +1,9 @@
 """股票訊號看板（台股 + 美股）。執行：streamlit run app.py"""
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
+import logging
 import hmac
 import inspect
 import os
@@ -24,7 +26,30 @@ import recap
 import store
 import symbols
 
+APP_VERSION = "v1.8（2026-10-30）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
+# 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
+
+
+@st.cache_resource
+def pool() -> cf.ThreadPoolExecutor:
+    """所有使用者共用的背景執行緒：同時抓多份資料、預先載入。"""
+    return cf.ThreadPoolExecutor(max_workers=12)
+
+
+def bg(fn, *args):
+    return pool().submit(fn, *args)
+
+
+def wait(fut, default=None):
+    try:
+        return fut.result()
+    except Exception as e:     # 交給呼叫的地方顯示錯誤
+        if default is not None:
+            return default
+        raise e
 
 st.markdown("""
 <style>
@@ -97,19 +122,42 @@ def colors(market: str, code: str = "") -> tuple[str, str]:
 # ----------------------------------------------------------------------------
 # 資料快取：歷史資料 30 分鐘、即時報價 20 秒
 # ----------------------------------------------------------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def name_table() -> dict:
+    """代號 → 名稱（內建清單，不用連網）。"""
+    tw = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tw_stocks.csv"), dtype=str)
+    us = symbols.load_us()
+    out = {r.code: {"name": r.name, "en": ""} for r in tw.itertuples()}
+    out.update({r.code: {"name": r.cname, "en": r.name} for r in us.itertuples()})
+    return out
+
+
+def quick_name(code: str) -> str:
+    if engine.is_index(code):
+        n = indices.name_of(code)
+        return "" if n == code else n
+    return name_table().get(code, {}).get("name", "")
+
+
+def news_name(code: str) -> str:
+    """新聞搜尋用的名稱：台股用中文名，美股用英文公司名。"""
+    t = name_table().get(code, {})
+    return t.get("en") or t.get("name", "") if not code[0].isdigit() else t.get("name", "")
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def load(code: str, days: int, token: str | None):
     market = engine.detect_market(code)
     start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
     if market == "TW":
         df = engine.fetch_tw(code, start, token or None)
-        name = engine.tw_name(code, token or None)
+        name = quick_name(code) or engine.tw_name(code, token or None)
     elif market == "IDX":
         df = engine.fetch_index(code, start)
-        name = indices.name_of(code) if indices.name_of(code) != code else ""
+        name = quick_name(code)
     else:
         df = engine.fetch_us(code, start)
-        name = engine.us_name(code)
+        name = quick_name(code) or engine.us_name(code)
     return market, name, df
 
 
@@ -141,15 +189,58 @@ def get_ov():
         return {"ok": False, "nq": 0.0}
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_groups(token: str):
+    return symbols.load_tw(token or None)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_registry():
+    return company.tw_registry()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_company(code: str, market: str, name: str, token: str):
+    if market == "TW":
+        f_g, f_reg = bg(get_groups, token or ""), bg(get_registry)
+        g = wait(f_g, pd.DataFrame(columns=["code", "group"]))
+        grp = g.loc[g["code"] == code, "group"]
+        return company.tw(code, name, wait(f_reg, {}), token or None, grp.iloc[0] if len(grp) else "")
+    t = name_table().get(code, {})
+    return company.us(code, " ".join(x for x in [t.get("name", ""), t.get("en", "")] if x))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_tw_recap(token: str, favs: tuple):
+    return recap.tw(get_groups(token), token or None, list(favs))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_us_recap(favs: tuple):
+    return recap.us(list(favs))
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_prob(code: str, days: int, token: str | None):
-    market, name, r = analyze(code, days, token)
-    try:
-        items = get_news(code, market, name)
-    except Exception:
-        items = []
-    rev = get_rev(code, token or "") if market == "TW" else None
-    return prob.estimate(r, code, items, rev, get_ov())
+    market = engine.detect_market(code)
+    f_an = bg(analyze, code, days, token)
+    f_news = bg(get_news, code, market, news_name(code))
+    f_rev = bg(get_rev, code, token or "") if market == "TW" else None
+    f_ov = bg(get_ov)
+    _, _, r = f_an.result()
+    items = wait(f_news, [])
+    rev = wait(f_rev, pd.DataFrame()) if f_rev else None
+    return prob.estimate(r, code, items, rev, wait(f_ov, {"ok": False, "nq": 0.0}))
+
+
+def warm(codes, token: str, days: int = 730, company_too: bool = False):
+    """背景預先載入：使用者點進去時資料已經在快取裡，畫面會直接出現。"""
+    futs = []
+    for c in codes:
+        futs.append(bg(get_prob, c, days, token))
+        if company_too and engine.detect_market(c) != "IDX":
+            futs.append(bg(get_company, c, engine.detect_market(c), news_name(c), token or ""))
+    return futs
 
 
 def with_prob(r: dict, P: dict | None) -> dict:
@@ -222,7 +313,17 @@ def search_options(token: str):
     return symbols.build_options(symbols.load_tw(token or None), symbols.load_us())
 
 
-SEARCH_OPTS, NAME2CODE = search_options(SAVED_TOKEN)
+@st.cache_data(ttl=86400, show_spinner=False)
+def search_options_local():
+    tw = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tw_stocks.csv"), dtype=str)
+    return symbols.build_options(tw, symbols.load_us())
+
+
+_f_opts = st.session_state.get("_f_opts")
+if _f_opts is None:
+    _f_opts = st.session_state["_f_opts"] = bg(search_options, SAVED_TOKEN)
+SEARCH_OPTS, NAME2CODE = (_f_opts.result() if _f_opts.done() and not _f_opts.exception()
+                          else search_options_local())
 
 
 def _pick(key: str) -> str | None:
@@ -303,6 +404,7 @@ with st.sidebar:
         st.rerun()
     st.caption(f"最愛儲存於：{fav_store.label}")
     st.caption("歷史資料每 30 分鐘更新；開盤時報價每 60 秒自動更新。")
+    st.caption(f"版本 {APP_VERSION}")
 
 st.session_state.pop("jump", None)
 if st.session_state.nav != HOME:
@@ -372,6 +474,15 @@ if st.session_state.nav == HOME:
                     st.button("K 線與分析 ›", key=f"idx_open_{sym}", on_click=open_stock, args=(sym,),
                               type="tertiary", width="stretch")
 
+    # 背景預先載入：點進個股、盤後整理時就不用再等
+    if not st.session_state.get("_warmed") or (dt.datetime.now() - st.session_state["_warmed"]).seconds > 900:
+        st.session_state["_warmed"] = dt.datetime.now()
+        warm(st.session_state.favs, token, company_too=True)
+        bg(get_ov)
+        bg(get_tw_recap, token, tuple(st.session_state.favs))
+        bg(get_us_recap, tuple(st.session_state.favs))
+        warm(["^TWII"], token)
+
     st.markdown("#### 📊 市場指數")
     with st.container(key="idx"):
         index_board()
@@ -394,20 +505,22 @@ if st.session_state.nav == HOME:
     def fav_board():
         if st.session_state.pop("jump", False):
             st.rerun(scope="app")
-        q = get_quotes(tuple(favs)) if favs else {}
+        f_q = bg(get_quotes, tuple(favs)) if favs else None
+        f_prob = {c: bg(get_prob, c, 730, token) for c in favs}        # 所有最愛同時計算
+        q = wait(f_q, {}) if f_q else {}
         rows, order = [], []
         prog = st.empty()
         for i, c in enumerate(favs):
-            if len(favs) > 1:
-                prog.caption(f"分析中 {i + 1}/{len(favs)}：{c}")
             row = {"代號": c, "名稱": "", "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
                    "現價": None, "漲跌": "—", "明日漲機率": None, "10日漲機率": None, "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
-                market, name, r = analyze(c, 730, token)
                 try:
-                    Pc = get_prob(c, 730, token)
+                    Pc = f_prob[c].result()
+                except engine.DataError:
+                    raise
                 except Exception:
                     Pc = None
+                market, name, r = analyze(c, 730, token)
                 r = with_prob(r, Pc)
                 row.update({"名稱": name,
                             "明日漲機率": round(Pc["next"]["p_up"] * 100) if Pc else None,
@@ -490,21 +603,6 @@ if st.session_state.nav == HOME:
 # ============================================================================
 # 頁面二：盤後整理
 # ============================================================================
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_groups(token: str):
-    return symbols.load_tw(token or None)
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_tw_recap(token: str, favs: tuple):
-    return recap.tw(get_groups(token), token or None, list(favs))
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_us_recap(favs: tuple):
-    return recap.us(list(favs))
-
-
 def pct_table(df: pd.DataFrame, key: str, tw_colors: bool, cols: dict, height: int | None = None):
     """可點選的漲跌表，點一列開啟個股分析。"""
     if df is None or df.empty:
@@ -733,16 +831,22 @@ if st.session_state.nav == RECAP:
 # 頁面三：個股分析
 # ============================================================================
 code = st.session_state.code
+# 一進頁面就把需要的資料「同時」送出去抓，不再一個等一個
+_mk = market_of(code)
+F_AN = bg(analyze, code, days, token)
+F_NEWS = bg(get_news, code, _mk, news_name(code))
+F_PROB = bg(get_prob, code, days, token)
+F_CO = bg(get_company, code, _mk, news_name(code), token or "") if _mk in ("TW", "US") else None
+F_Q = bg(get_quotes, (code,))
 try:
     with st.spinner(f"抓取 {code} 資料中…"):
-        market, name, r = analyze(code, days, token)
+        market, name, r = F_AN.result()
 except engine.DataError as e:
     st.error(str(e))
     st.stop()
 
 try:
-    with st.spinner("計算上漲／下跌機率中（技術、籌碼、營收、新聞、隔夜美股）…"):
-        P = get_prob(code, days, token)
+    P = F_PROB.result()
 except Exception as e:
     P = None
     st.warning(f"機率計算失敗：{e}")
@@ -927,7 +1031,7 @@ if market != "IDX":
                 if st.button("✨ 讓 Claude 分析這筆交易", key=f"pos_ai_btn_{code}"):
                     try:
                         with st.spinner("Claude 分析中…"):
-                            titles = [i["title"] for i in get_news(code, market, name)]
+                            titles = [i["title"] for i in wait(F_NEWS, [])]
                             st.session_state[f"pos_ai_{code}"] = news.ask_claude(
                                 ai_key, position.prompt(code, name, r, p, titles), model="claude-sonnet-5-5")
                     except Exception as e:
@@ -961,21 +1065,6 @@ def is_dark() -> bool:
 
 main, side = st.columns([2.4, 1], gap="medium")
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_registry():
-    return company.tw_registry()
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def get_company(code: str, market: str, name: str, price: float, token: str):
-    if market == "TW":
-        g = get_groups(token or "")
-        grp = g.loc[g["code"] == code, "group"]
-        return company.tw(code, name, get_registry(), price, token or None, grp.iloc[0] if len(grp) else "")
-    cname = next((o.split("・")[0].split(" ", 1)[1] for o in SEARCH_OPTS if o.startswith(code + " ")), "")
-    return company.us(code, cname)
-
-
 def kv_html(rows) -> str:
     out = []
     for k, v in rows:
@@ -993,7 +1082,7 @@ def company_panel():
         return
     try:
         with st.spinner("抓取公司資料中…"):
-            ci = get_company(code, market, name, float(r["close"]), token or "")
+            ci = F_CO.result() if F_CO else get_company(code, market, news_name(code), token or "")
     except Exception as e:
         st.caption(f"公司資料暫時取不到：{e}")
         return
@@ -1022,9 +1111,13 @@ def company_panel():
         if st.session_state.get(f"co_ai_txt_{code}"):
             st.info(st.session_state[f"co_ai_txt_{code}"])
 
-    if ci.get("rows"):
+    rows = list(ci.get("rows", []))
+    if ci.get("shares"):
+        rows.insert(-1 if rows and rows[-1][0] == "網址" else len(rows),
+                    ("市值（現價估算）", f"{ci['shares'] * float(r['close']) / 1e8:,.0f} 億元"))
+    if rows:
         st.markdown("**基本資料**")
-        st.markdown(kv_html(ci["rows"]), unsafe_allow_html=True)
+        st.markdown(kv_html(rows), unsafe_allow_html=True)
     if ci.get("valuation"):
         st.markdown("**估值**")
         st.markdown(kv_html(ci["valuation"]), unsafe_allow_html=True)
@@ -1048,13 +1141,9 @@ def company_panel():
 
 
 with side:
-    tab_co, tab_news = st.tabs(["🏢 公司資料", "📰 重點消息"])
-with tab_co:
-    with st.container(height=760, border=False):
-        company_panel()
-with tab_news:
+    st.markdown("#### 📰 重點消息")
     with st.spinner("抓取新聞中…"):
-        items = get_news(code, market, name)
+        items = wait(F_NEWS, [])
     only_key = st.toggle("只看重點", value=True, help="財報、營收、法說、股利、評等、籌碼、營運、風險相關，以及官方重大訊息")
     shown = [i for i in items if i["kind"] == "official" or i["tags"]] if only_key else items
     ai_key = secret("ANTHROPIC_API_KEY")
@@ -1088,7 +1177,10 @@ with tab_news:
                 unsafe_allow_html=True)
     st.caption("▲▼ 依標題關鍵字粗略判斷，僅供快速瀏覽。點標題開原文。")
 
-tab_k, tab_chip, tab_bt, tab_about = main.tabs(["K 線與預估", "籌碼 / 量能", "回測驗證", "說明"])
+tab_k, tab_chip, tab_co, tab_bt, tab_about = main.tabs(["K 線與預估", "籌碼 / 量能", "🏢 公司資訊", "回測驗證", "說明"])
+
+with tab_co:
+    company_panel()
 
 with tab_k:
     today = None

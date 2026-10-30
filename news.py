@@ -133,19 +133,22 @@ def _dedupe(items: list[Item]) -> list[Item]:
 
 
 def fetch(code: str, market: str, name: str = "", limit: int = 40) -> list[Item]:
+    from concurrent.futures import ThreadPoolExecutor
     items: list[Item] = []
-    if market == "TW":
-        items += _twse_official(code)
-        nm = name or code
-        got = _google(f"{nm} {code} when:7d", "zh")
-        if len(got) < 8:
-            got += _google(f"{nm} 股 when:7d", "zh")
-        items += got
-    else:
-        items += _yahoo(code)
-        items += _google(f'"{code}" stock when:7d', "en")
-        if name:
-            items += _google(f"{name.split()[0]} 股價 when:7d", "zh")
+    with ThreadPoolExecutor(4) as ex:            # 各個新聞來源同時抓
+        if market == "TW":
+            nm = name or code
+            futs = [ex.submit(_twse_official, code), ex.submit(_google, f"{nm} {code} when:7d", "zh"),
+                    ex.submit(_google, f"{nm} 股 when:7d", "zh")]
+        else:
+            futs = [ex.submit(_yahoo, code), ex.submit(_google, f'"{code}" stock when:7d', "en")]
+            if name:
+                futs.append(ex.submit(_google, f"{name.split()[0]} 股價 when:7d", "zh"))
+        for f in futs:
+            try:
+                items += f.result()
+            except Exception:
+                pass
     cutoff = dt.datetime.now(TW_TZ) - dt.timedelta(days=8)
     items = [i for i in items if i["time"] >= cutoff or i["kind"] == "official"]
     return _dedupe(items)[:limit]
