@@ -13,7 +13,8 @@ def _d(x) -> str:
 
 
 def build(df: pd.DataFrame, cone: pd.DataFrame, up: str, down: str, stop: float | None, stop_label: str = "停損參考",
-          today: dict | None = None, dark: bool = False, cost: float | None = None, height: int = 560, vol_unit: str = "張") -> str:
+          today: dict | None = None, dark: bool = False, cost: float | None = None, height: int = 560, vol_unit: str = "張", view: int = 66) -> str:
+    """view：一開始顯示最近幾根 K 棒（側邊欄「資料期間」）。"""
     candles = [{"time": _d(r.date), "open": r.open, "high": r.high, "low": r.low, "close": r.close}
                for r in df.itertuples()]
     vols = [{"time": _d(r.date), "value": float(r.vol),
@@ -38,6 +39,7 @@ def build(df: pd.DataFrame, cone: pd.DataFrame, up: str, down: str, stop: float 
     return f"""
 <div id="wrap" style="font-family:system-ui,-apple-system,'Microsoft JhengHei',sans-serif;color:{th['fg']}">
   <div id="bar" style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 6px">
+    <button data-n="{view}" id="vsel">選定期間（{view} 日）</button>
     <button data-n="22">1月</button><button data-n="66">3月</button><button data-n="132">6月</button>
     <button data-n="250">1年</button><button data-n="0">全部</button>
     <span style="flex:1"></span>
@@ -129,6 +131,6 @@ function setRange(n, b) {{
   btns.forEach(x => x.classList.toggle('on', x === b));
 }}
 btns.forEach(b => b.onclick = () => setRange(+b.dataset.n, b));
-setRange(132, btns[2]);
+setRange({view}, btns[0]);
 </script>
 """

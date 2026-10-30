@@ -23,14 +23,51 @@ class StoreError(Exception):
     pass
 
 
+DEFAULT_GROUP = "我的最愛"
+
+
+def clean_groups(groups, extra=None) -> list[dict]:
+    """群組清單：[{"name": 名稱, "codes": [代號…]}]。名稱不重複、每檔股票只屬於一個群組、順序保留。"""
+    out, seen_code, seen_name = [], set(), set()
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name") or "").strip() or DEFAULT_GROUP
+        base, k = name, 2
+        while name in seen_name:
+            name, k = f"{base} {k}", k + 1
+        seen_name.add(name)
+        codes = []
+        for c in _clean(g.get("codes")):
+            if c not in seen_code:
+                seen_code.add(c)
+                codes.append(c)
+        out.append({"name": name, "codes": codes})
+    if not out:
+        out = [{"name": DEFAULT_GROUP, "codes": []}]
+    for c in _clean(extra):                      # 在最愛清單、但不在任何群組的 → 放到第一組
+        if c not in seen_code:
+            seen_code.add(c)
+            out[0]["codes"].append(c)
+    return out
+
+
+def flatten(groups) -> list[str]:
+    return [c for g in groups for c in g["codes"]]
+
+
 def _normalize(data) -> dict:
-    """舊格式（只有最愛清單）自動轉成新格式。"""
+    """舊格式（只有最愛清單、或沒有群組）自動轉成新格式。"""
     if isinstance(data, list):
         data = {"favorites": data}
     data = data if isinstance(data, dict) else {}
     pos = data.get("positions") or {}
     idx = data.get("indices")
-    return {"favorites": _clean(data.get("favorites", DEFAULT)),
+    if data.get("groups"):
+        groups = clean_groups(data["groups"])
+    else:
+        groups = clean_groups([{"name": DEFAULT_GROUP, "codes": data.get("favorites", DEFAULT)}])
+    return {"favorites": flatten(groups), "groups": groups,
             "indices": _clean(DEFAULT_INDICES if idx is None else idx),
             "positions": {str(k).upper(): v for k, v in pos.items() if isinstance(v, dict) and v.get("cost")}}
 

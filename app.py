@@ -28,7 +28,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.2（2026-10-31）"
+APP_VERSION = "v2.3（2026-10-31）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -103,12 +103,14 @@ if APP_PASSWORD and not st.session_state.get("authed"):
 
 SAVED_TOKEN = secret("FINMIND_TOKEN")
 company.set_sec_contact(secret("SEC_CONTACT"))
-PERIODS = {"6 個月": 183, "1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825, "10 年": 3650}
-MIN_DAYS, MAX_DAYS = 183, 365 * 20
+PERIODS = {"3 個月": 92, "6 個月": 183, "1 年": 365, "2 年": 730, "3 年": 1095, "5 年": 1825, "10 年": 3650}
+DEFAULT_PERIOD = "3 個月"            # 每次打開預設看 3 個月
+MIN_DAYS, MAX_DAYS = 5, 365 * 20
+MODEL_DAYS = 730                     # 機率、評分、回測至少用 2 年資料，不受顯示期間影響
 
 
 def parse_period(text: str) -> tuple[int, str]:
-    """把「6個月」「18個月」「3年」「250天」「12週」「2024-01-01」這類輸入轉成天數。"""
+    """把「45」「6個月」「18個月」「3年」「250天」「12週」「2024-01-01」這類輸入轉成天數。只打數字＝天數。"""
     t = str(text or "").strip().replace(" ", "").lower()
     if t in {k.replace(" ", "") for k in PERIODS}:
         k = next(k for k in PERIODS if k.replace(" ", "") == t)
@@ -119,8 +121,8 @@ def parse_period(text: str) -> tuple[int, str]:
         return (dt.date.today() - d0).days, f"{d0:%Y-%m-%d} 起"
     m = re.fullmatch(r"(\d+(?:\.\d+)?)(天|日|d|day|days|週|周|w|week|weeks|個月|月|m|mo|month|months|年|y|yr|year|years)?", t)
     if not m:
-        raise ValueError(f"看不懂「{text}」，可以輸入例如：6個月、18個月、3年、250天、2024-01-01")
-    n, u = float(m.group(1)), (m.group(2) or "年")
+        raise ValueError(f"看不懂「{text}」，可以輸入例如：45（天）、3個月、18個月、3年、2024-01-01")
+    n, u = float(m.group(1)), (m.group(2) or "天")
     mult = 1 if u in ("天", "日", "d", "day", "days") else 7 if u in ("週", "周", "w", "week", "weeks") \
         else 30.44 if u in ("個月", "月", "m", "mo", "month", "months") else 365.25
     unit_zh = {1: "天", 7: "週", 30.44: "個月", 365.25: "年"}[mult]
@@ -132,17 +134,20 @@ def on_period_change():
         d, label = parse_period(st.session_state.period_pick)
     except ValueError as e:
         st.session_state.store_err = str(e)
-        st.session_state.period_pick = st.session_state.get("period_label", "2 年")
+        st.session_state.period_pick = st.session_state.get("period_label", DEFAULT_PERIOD)
         return
     note = ""
     if d < MIN_DAYS:
-        d, note = MIN_DAYS, f"（{label}太短，分析至少需要約半年資料，已改為 6 個月）"
+        d, note = MIN_DAYS, f"（{label}太短，最少 {MIN_DAYS} 天）"
     elif d > MAX_DAYS:
         d, note = MAX_DAYS, "（最多 20 年）"
     st.session_state.period_days = d
     st.session_state.period_label = st.session_state.period_pick
+    st.session_state.period_text = label if not note else (f"{d} 天" if d == MIN_DAYS else "20 年")
     if note:
         st.session_state.store_err = "資料期間" + note
+    elif str(st.session_state.get("store_err", "")).startswith(("資料期間", "看不懂")):
+        st.session_state.pop("store_err")
 LIVE_EVERY = 60          # 盤中即時報價更新秒數
 VIEWS = ["📈 市場總覽", "📰 盤後整理", "🔍 個股分析"]
 HOME, RECAP, STOCK = VIEWS
@@ -329,31 +334,138 @@ if "favs" not in st.session_state:
     try:
         _data = fav_store.load()
     except store.StoreError as e:
-        _data = {"favorites": list(store.DEFAULT), "positions": {}, "indices": list(store.DEFAULT_INDICES)}
+        _data = {"favorites": list(store.DEFAULT), "positions": {}, "indices": list(store.DEFAULT_INDICES),
+                 "groups": store.clean_groups(None, store.DEFAULT)}
         st.session_state.store_err = str(e)
-    st.session_state.favs = _data["favorites"]
+    st.session_state.groups = _data.get("groups") or store.clean_groups(None, _data["favorites"])
+    st.session_state.favs = store.flatten(st.session_state.groups)
     st.session_state.positions = _data["positions"]
     st.session_state.indices = _data.get("indices", list(store.DEFAULT_INDICES))
 
 
 def save_favs():
+    """群組是正本；favs（全部最愛的平面清單）一律由群組重新產生。"""
+    st.session_state.groups = store.clean_groups(st.session_state.groups)
+    st.session_state.favs = store.flatten(st.session_state.groups)
+    st.session_state.manage_open = True        # 在首頁調整清單時，管理面板保持展開
     try:
-        fav_store.save({"favorites": st.session_state.favs, "positions": st.session_state.positions,
-                        "indices": st.session_state.indices})
+        fav_store.save({"favorites": st.session_state.favs, "groups": st.session_state.groups,
+                        "positions": st.session_state.positions, "indices": st.session_state.indices})
         st.session_state.pop("store_err", None)
     except store.StoreError as e:
         st.session_state.store_err = str(e) + "（這次的變更只在目前畫面有效）"
 
 
+def group_names() -> list[str]:
+    return [g["name"] for g in st.session_state.groups]
+
+
+def group_of(code: str) -> str | None:
+    return next((g["name"] for g in st.session_state.groups if code in g["codes"]), None)
+
+
+def _grp(name: str) -> dict | None:
+    return next((g for g in st.session_state.groups if g["name"] == name), None)
+
+
+def fav_add(code: str, group: str | None = None):
+    if code in st.session_state.favs:
+        return
+    g = _grp(group or "") or st.session_state.groups[0]
+    g["codes"].append(code)
+    save_favs()
+
+
+def fav_remove(code: str):
+    for g in st.session_state.groups:
+        if code in g["codes"]:
+            g["codes"].remove(code)
+    save_favs()
+
+
+def fav_move(code: str, step: int):
+    """在群組內上移（-1）或下移（+1）；到頂／到底時移到上一個／下一個群組。"""
+    gs = st.session_state.groups
+    gi = next((i for i, g in enumerate(gs) if code in g["codes"]), None)
+    if gi is None:
+        return
+    lst = gs[gi]["codes"]
+    i = lst.index(code)
+    j = i + step
+    if 0 <= j < len(lst):
+        lst[i], lst[j] = lst[j], lst[i]
+    elif 0 <= gi + step < len(gs):
+        lst.remove(code)
+        nxt = gs[gi + step]["codes"]
+        nxt.append(code) if step < 0 else nxt.insert(0, code)
+    save_favs()
+
+
+def fav_to_group(code: str):
+    target = st.session_state.get(f"mv_{code}")
+    if target and target != group_of(code):
+        for g in st.session_state.groups:
+            if code in g["codes"]:
+                g["codes"].remove(code)
+        _grp(target)["codes"].append(code)
+        save_favs()
+
+
+def group_add():
+    st.session_state.manage_open = True
+    name = (st.session_state.get("new_group") or "").strip()
+    st.session_state.new_group = ""
+    if not name:
+        return
+    if name in group_names():
+        st.session_state.store_err = f"已經有「{name}」這個群組了。"
+        return
+    st.session_state.groups.append({"name": name, "codes": []})
+    save_favs()
+
+
+def group_rename(old: str):
+    new = (st.session_state.get(f"gname_{old}") or "").strip()
+    if not new or new == old:
+        return
+    if new in group_names():
+        st.session_state.store_err = f"已經有「{new}」這個群組了。"
+        return
+    _grp(old)["name"] = new
+    if st.session_state.get("fav_view") == old:
+        st.session_state.fav_view = new
+    save_favs()
+
+
+def group_move(name: str, step: int):
+    gs = st.session_state.groups
+    i = group_names().index(name)
+    j = i + step
+    if 0 <= j < len(gs):
+        gs[i], gs[j] = gs[j], gs[i]
+        save_favs()
+
+
+def group_delete(name: str):
+    gs = st.session_state.groups
+    if len(gs) <= 1:
+        return
+    i = group_names().index(name)
+    g = gs.pop(i)
+    gs[0]["codes"].extend(g["codes"])        # 群組裡的股票移到（剩下的）第一個群組，不會不見
+    if st.session_state.get("fav_view") == name:
+        st.session_state.fav_view = "全部"
+    save_favs()
+
+
 def toggle_fav(code: str):
-    favs = st.session_state.favs
-    if code in favs:
-        favs.remove(code)
+    if code in st.session_state.favs:
+        fav_remove(code)
         st.toast(f"已從最愛移除 {code}")
     else:
-        favs.append(code)
-        st.toast(f"已加入最愛 {code}")
-    save_favs()
+        g = st.session_state.get("add_group")
+        fav_add(code, g)
+        st.toast(f"已加入最愛 {code}（{group_of(code)}）")
 
 
 def open_stock(code: str):
@@ -408,9 +520,8 @@ def on_search():
 
 def add_fav_from_input():
     code = _pick("add_search")
-    if code and code not in st.session_state.favs:
-        st.session_state.favs.append(code)
-        save_favs()
+    if code:
+        fav_add(code, st.session_state.get("add_group"))
 
 
 def search_box(key: str, label: str, on_change):
@@ -421,9 +532,7 @@ def search_box(key: str, label: str, on_change):
 
 
 def remove_fav(code: str):
-    if code in st.session_state.favs:
-        st.session_state.favs.remove(code)
-        save_favs()
+    fav_remove(code)
 
 
 def on_table_select():
@@ -451,8 +560,9 @@ if "nav" not in st.session_state:
     _p = _qp.get("p")
     if _p and "period_pick" not in st.session_state:
         try:
-            _d, _ = parse_period(_p)
+            _d, _t = parse_period(_p)
             st.session_state.period_pick = _p
+            st.session_state.period_text = _t
             st.session_state.period_label = _p
             st.session_state.period_days = min(max(_d, MIN_DAYS), MAX_DAYS)
         except ValueError:
@@ -464,19 +574,27 @@ with st.sidebar:
     st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed")
     search_box("search", "🔍 搜尋股票", on_search)
     if "period_pick" not in st.session_state:
-        st.session_state.period_pick, st.session_state.period_days = "2 年", 730
+        st.session_state.period_pick, st.session_state.period_days = DEFAULT_PERIOD, PERIODS[DEFAULT_PERIOD]
     popts = list(PERIODS)
     if st.session_state.period_pick not in popts:
         popts = [st.session_state.period_pick] + popts
     st.selectbox("資料期間", popts, key="period_pick", on_change=on_period_change, accept_new_options=True,
-                 help="可直接選，也可以自己打：例如 18個月、4年、250天、2024-01-01（從這天到今天）")
+                 help="可直接選，也可以自己打後按 Enter：直接打數字就是天數（例如 45 = 近 45 天），"
+                      "也可以打 18個月、4年、12週、2024-01-01（從這天到今天）。"
+                      "這裡決定 K 線與「期間表現」看多久；機率與評分固定用至少 2 年資料計算，不受影響。")
 
     st.caption("⭐ 我的最愛")
     if st.session_state.favs:
-        cols = st.columns(2)
-        for i, f in enumerate(st.session_state.favs):
-            cols[i % 2].button(f, key=f"fav_{f}", width="stretch", on_click=open_stock, args=(f,),
-                               type="primary" if f == st.session_state.code and st.session_state.nav == STOCK else "secondary")
+        _multi = len(st.session_state.groups) > 1
+        for g in st.session_state.groups:
+            if not g["codes"]:
+                continue
+            if _multi:
+                st.markdown(f"<div class='small' style='margin:4px 0 -6px'>📁 {g['name']}</div>", unsafe_allow_html=True)
+            cols = st.columns(2)
+            for i, f in enumerate(g["codes"]):
+                cols[i % 2].button(f, key=f"fav_{f}", width="stretch", on_click=open_stock, args=(f,),
+                                   type="primary" if f == st.session_state.code and st.session_state.nav == STOCK else "secondary")
     else:
         st.caption("還沒有收藏。到個股頁按「☆ 加入最愛」。")
 
@@ -493,7 +611,7 @@ st.session_state.pop("jump", None)
 _want = {"v": QP_KEY[st.session_state.nav]}
 if st.session_state.nav == STOCK:
     _want["s"] = st.session_state.code
-if st.session_state.get("period_pick", "2 年") != "2 年":
+if st.session_state.get("period_pick", DEFAULT_PERIOD) != DEFAULT_PERIOD:
     _want["p"] = st.session_state.period_pick
 if {k: st.query_params.get(k) for k in st.query_params} != _want:
     st.query_params.from_dict(_want)
@@ -503,7 +621,8 @@ if st.session_state.nav != HOME:
 if st.session_state.get("store_err"):
     st.warning(st.session_state.store_err)
 
-days = int(st.session_state.get("period_days", 730))
+days = int(st.session_state.get("period_days", PERIODS[DEFAULT_PERIOD]))
+fetch_days = max(days, MODEL_DAYS)       # 實際抓的資料長度（模型需要）
 any_open = live.is_open("TW") or live.is_open("US")
 
 
@@ -587,9 +706,27 @@ if st.session_state.nav == HOME:
                    "台股指數紅漲綠跌，其他市場綠漲紅跌。")
 
     st.markdown("#### ⭐ 我的最愛")
-    favs = list(st.session_state.favs)
-    if not favs:
-        st.info("清單是空的。在下方輸入代號加入，或到個股頁按「☆ 加入最愛」。")
+    _gn = group_names()
+    if len(_gn) > 1:
+        _views = ["全部"] + _gn
+        if st.session_state.get("fav_view") not in _views:
+            st.session_state.fav_view = "全部"
+        _lbl = {"全部": f"全部（{len(st.session_state.favs)}）",
+                **{g["name"]: f"{g['name']}（{len(g['codes'])}）" for g in st.session_state.groups}}
+        if hasattr(st, "segmented_control"):
+            st.segmented_control("群組", _views, key="fav_view", format_func=lambda x: _lbl[x],
+                                 label_visibility="collapsed")
+            if not st.session_state.get("fav_view"):        # 再點一次會取消選取 → 回到全部
+                st.session_state.fav_view = "全部"
+        else:
+            st.radio("群組", _views, key="fav_view", format_func=lambda x: _lbl[x], horizontal=True,
+                     label_visibility="collapsed")
+    fav_view = st.session_state.get("fav_view") or "全部"
+    favs = list(st.session_state.favs) if fav_view == "全部" or len(_gn) <= 1 else list(_grp(fav_view)["codes"])
+    if not st.session_state.favs:
+        st.info("清單是空的。在下方「管理清單」輸入代號加入，或到個股頁按「☆ 加入最愛」。")
+    elif not favs:
+        st.info(f"「{fav_view}」群組還沒有股票，到下方「管理清單」加入或從別的群組移過來。")
 
     @st.fragment(run_every=LIVE_EVERY if any_open else None)
     def fav_board():
@@ -601,7 +738,7 @@ if st.session_state.nav == HOME:
         rows, order = [], []
         prog = st.empty()
         for i, c in enumerate(favs):
-            row = {"代號": c, "名稱": "", "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
+            row = {"代號": c, "名稱": "", **({"群組": group_of(c)} if fav_view == "全部" and len(_gn) > 1 else {}), "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
                    "現價": None, "漲跌": "—", "明日漲機率": None, "10日漲機率": None, "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
                 try:
@@ -678,12 +815,43 @@ if st.session_state.nav == HOME:
 
     fav_board()
 
-    with st.expander("管理清單"):
-        search_box("add_search", "新增到最愛", add_fav_from_input)
-        for c in favs:
-            x, y = st.columns([4, 1], vertical_alignment="center")
-            x.write(c)
-            y.button("移除", key=f"rm_{c}", on_click=remove_fav, args=(c,), width="stretch")
+    with st.expander("管理清單（群組、排序）", expanded=bool(st.session_state.pop("manage_open", False))):
+        _gn = group_names()
+        a1, a2 = st.columns([3, 1.4], vertical_alignment="bottom")
+        with a1:
+            search_box("add_search", "新增到最愛", add_fav_from_input)
+        if st.session_state.get("add_group") not in _gn:
+            st.session_state.add_group = fav_view if fav_view in _gn else _gn[0]
+        a2.selectbox("加到群組", _gn, key="add_group")
+        b1, b2 = st.columns([3, 1.4], vertical_alignment="bottom")
+        b1.text_input("新增群組", key="new_group", placeholder="輸入群組名稱，例如：半導體、存股、觀察中")
+        b2.button("＋ 建立群組", on_click=group_add, width="stretch")
+        st.caption("↑↓ 調整順序（移到群組最上／最下再按一次，會移到上一個／下一個群組）；"
+                   "「移到」可直接換群組；群組名稱改完按 Enter。")
+        for gi, g in enumerate(st.session_state.groups):
+            with st.container(border=True):
+                h1, h2, h3, h4 = st.columns([4, 1, 1, 1.4], vertical_alignment="bottom")
+                h1.text_input("群組名稱", value=g["name"], key=f"gname_{g['name']}", on_change=group_rename,
+                              args=(g["name"],), label_visibility="collapsed")
+                h2.button("↑", key=f"gup_{g['name']}", on_click=group_move, args=(g["name"], -1),
+                          disabled=gi == 0, width="stretch", help="群組上移")
+                h3.button("↓", key=f"gdn_{g['name']}", on_click=group_move, args=(g["name"], 1),
+                          disabled=gi == len(st.session_state.groups) - 1, width="stretch", help="群組下移")
+                h4.button("刪除群組", key=f"gdel_{g['name']}", on_click=group_delete, args=(g["name"],),
+                          disabled=len(st.session_state.groups) <= 1, width="stretch",
+                          help="群組裡的股票會移到第一個群組，不會被刪掉")
+                if not g["codes"]:
+                    st.caption("（空的）")
+                for c in g["codes"]:
+                    x, u, d_, mv, y = st.columns([3, 0.8, 0.8, 2, 1], vertical_alignment="center")
+                    x.markdown(f"**{c}** <span class='small'>{quick_name(c)}</span>", unsafe_allow_html=True)
+                    u.button("↑", key=f"up_{c}", on_click=fav_move, args=(c, -1), width="stretch")
+                    d_.button("↓", key=f"dn_{c}", on_click=fav_move, args=(c, 1), width="stretch")
+                    if len(st.session_state.groups) > 1:
+                        st.session_state[f"mv_{c}"] = g["name"]
+                        mv.selectbox("移到", _gn, key=f"mv_{c}", on_change=fav_to_group, args=(c,),
+                                     label_visibility="collapsed")
+                    y.button("移除", key=f"rm_{c}", on_click=remove_fav, args=(c,), width="stretch")
 
     st.caption("本工具為個人研究用技術原型，不構成投資建議。")
     st.stop()
@@ -947,9 +1115,9 @@ if st.session_state.nav == RECAP:
 code = st.session_state.code
 # 一進頁面就把需要的資料「同時」送出去抓，不再一個等一個
 _mk = market_of(code)
-F_AN = bg(analyze, code, days, token)
+F_AN = bg(analyze, code, fetch_days, token)
 F_NEWS = bg(get_news, code, _mk, news_name(code))
-F_PROB = bg(get_prob, code, days, token)
+F_PROB = bg(get_prob, code, fetch_days, token)
 F_CO = bg(get_company, code, _mk, news_name(code), token or "") if _mk in ("TW", "US") else None
 F_Q = bg(get_quotes, (code,))
 F_INTRA = bg(get_intraday, code, _mk) if _mk != "IDX" or code in ("^TWII", "^GSPC", "^IXIC", "^DJI", "^SOX") else None
@@ -981,9 +1149,26 @@ STOP_REF, STOP_LABEL = (pos_p["stop"], "我的停損") if pos_p else (r["stop"],
 
 t1, t2 = st.columns([5, 1.2], vertical_alignment="center")
 t1.title(f"{code} {name}".strip())
-t2.button("★ 已在最愛" if is_fav else "☆ 加入最愛", on_click=toggle_fav, args=(code,),
-          type="primary" if is_fav else "secondary", width="stretch")
-st.caption(f"{mk_label}｜分析基準：{r['asof']} 收盤｜{len(df)} 個交易日")
+if is_fav:
+    t2.button("★ 已在最愛", on_click=toggle_fav, args=(code,), type="primary", width="stretch",
+              help=f"在「{group_of(code)}」群組，再按一次移除")
+elif len(st.session_state.groups) == 1:
+    t2.button("☆ 加入最愛", on_click=fav_add, args=(code,), width="stretch")
+else:
+    with t2.popover("☆ 加入最愛", width="stretch"):
+        st.caption("加到哪個群組？")
+        for _g in group_names():
+            st.button(f"📁 {_g}", key=f"addto_{_g}", on_click=fav_add, args=(code, _g), width="stretch")
+
+# 顯示期間：K 線一開始顯示的範圍、「期間表現」、籌碼圖都依這個；模型仍用完整資料
+VIEW_START = pd.Timestamp(dt.date.today() - dt.timedelta(days=days))
+dfv = df[df["date"] >= VIEW_START]
+if len(dfv) < 2:
+    dfv = df.tail(2)
+N_VIEW = len(dfv)
+PERIOD_LABEL = st.session_state.get("period_text") or st.session_state.get("period_pick") or DEFAULT_PERIOD
+st.caption(f"{mk_label}｜分析基準：{r['asof']} 收盤｜顯示期間：{PERIOD_LABEL}（{N_VIEW} 個交易日）"
+           f"｜機率與評分使用近 {len(df)} 個交易日資料")
 
 
 @st.fragment(run_every=LIVE_EVERY if live.is_open(SESSION) else None)
@@ -1056,6 +1241,70 @@ if P and P["next"].get("gap_mu") is not None:
 
 st.markdown("#### AI 解讀")
 st.markdown(f"<div class='ai'>{P['summary'] if P else r['explain']}</div>", unsafe_allow_html=True)
+
+
+def period_summary(v: pd.DataFrame, full: pd.DataFrame, market: str):
+    """依側邊欄選的期間（例如近 45 天）整理這段時間的表現與判讀。"""
+    unit = {"TW": "張", "US": "股"}.get(market, "")
+    c0 = float(full["close"][full["date"] < v["date"].iloc[0]].iloc[-1]) if (full["date"] < v["date"].iloc[0]).any() \
+        else float(v["open"].iloc[0])
+    c1 = float(v["close"].iloc[-1])
+    ret = c1 / c0 - 1
+    hi_i, lo_i = v["high"].idxmax(), v["low"].idxmin()
+    hi, lo = float(v.loc[hi_i, "high"]), float(v.loc[lo_i, "low"])
+    pos = (c1 - lo) / (hi - lo) if hi > lo else 0.5
+    cl = v["close"].astype(float)
+    dd = float((cl / cl.cummax() - 1).min())
+    rets = cl.pct_change().dropna()
+    vol_y = float(rets.std() * np.sqrt(252)) if len(rets) > 2 else np.nan
+    up_days = int((rets > 0).sum())
+    n = len(v)
+    prev_v = full[full["date"] < v["date"].iloc[0]].tail(n)
+    vr = float(v["vol"].mean() / prev_v["vol"].mean()) if len(prev_v) >= max(3, n // 2) and prev_v["vol"].mean() > 0 else np.nan
+    metrics = [("區間漲跌", fmt_chg(ret), f"{c0:,.2f} → {c1:,.2f}"),
+               ("區間最高／最低", f"{hi:,.2f}／{lo:,.2f}", f"{v.loc[hi_i, 'date']:%m/%d} 高、{v.loc[lo_i, 'date']:%m/%d} 低"),
+               ("目前位置", f"{pos * 100:.0f}%", f"距最高 {c1 / hi - 1:+.1%}"),
+               ("最大回落", f"{dd:.1%}", f"上漲 {up_days} 天／共 {len(rets)} 天")]
+    lines = []
+    trend = ("明顯上漲" if ret >= 0.08 else "偏多" if ret >= 0.02 else "明顯下跌" if ret <= -0.08 else "偏空" if ret <= -0.02 else "盤整")
+    lines.append(f"這 {n} 個交易日{trend}（{ret:+.1%}），目前在區間的 {pos * 100:.0f}% 位置"
+                 + ("，接近區間高點。" if pos >= 0.8 else "，接近區間低點。" if pos <= 0.2 else "。"))
+    if pd.notna(vol_y):
+        lines.append(f"年化波動約 {vol_y:.0%}，期間最大回落 {dd:.1%}" +
+                     ("，波動偏大，停損要放寬或部位縮小。" if vol_y >= 0.45 else "。"))
+    if pd.notna(vr):
+        lines.append(f"平均成交量是前一段同樣天數的 {vr:.1f} 倍（{'量增' if vr >= 1.2 else '量縮' if vr <= 0.8 else '量平'}）"
+                     + ("，價漲量增，買盤有跟上。" if ret > 0 and vr >= 1.2 else
+                        "，價跌量增，賣壓較重。" if ret < 0 and vr >= 1.2 else
+                        "，上漲但量縮，追價力道偏弱。" if ret > 0 and vr <= 0.8 else "。"))
+    if market == "TW" and {"foreign", "trust", "dealer"} <= set(v.columns):
+        f_, t_, d_ = (float(v[k].sum()) for k in ("foreign", "trust", "dealer"))
+        if abs(f_) + abs(t_) + abs(d_) > 0:
+            metrics.append(("三大法人合計", f"{f_ + t_ + d_:+,.0f} {unit}", f"外資 {f_:+,.0f}｜投信 {t_:+,.0f}｜自營 {d_:+,.0f}"))
+            who = [nm for nm, x in (("外資", f_), ("投信", t_)) if x > 0]
+            sold = [nm for nm, x in (("外資", f_), ("投信", t_)) if x < 0]
+            lines.append(("期間" + "、".join(who) + "站在買方" if who else "") +
+                         ("，" if who and sold else "") + ("期間" + "、".join(sold) + "站在賣方" if sold else "") + "。")
+        if "margin" in v.columns and v["margin"].notna().sum() >= 2:
+            m = v["margin"].dropna()
+            dm = float(m.iloc[-1] - m.iloc[0])
+            lines.append(f"融資{'增加' if dm >= 0 else '減少'} {abs(dm):,.0f} 張"
+                         + ("，股價跌但融資增，散戶在攤平，要小心。" if ret < 0 and dm > 0 else
+                            "，股價漲但融資減，籌碼往法人集中，偏健康。" if ret > 0 and dm < 0 else "。"))
+    return metrics, lines
+
+
+with st.expander(f"📅 期間表現（{PERIOD_LABEL}，{N_VIEW} 個交易日）", expanded=True):
+    try:
+        _pm, _pl = period_summary(dfv, df, market)
+        _cols = st.columns(len(_pm))
+        for _col, (_l, _v, _s) in zip(_cols, _pm):
+            card(_col, _l, _v, _s)
+        st.markdown("\n".join(f"- {x}" for x in _pl if x and x != "。"))
+        st.caption("天數在左側「資料期間」調整，直接打數字就是天數（例如 45、120）。"
+                   "這裡只統計這段期間；上方的上漲機率固定用至少 2 年資料計算。")
+    except Exception as e:
+        st.caption(f"期間表現計算失敗：{e}")
 
 
 # --- 🕒 盤前／盤中／盤後整理 ---
@@ -1421,12 +1670,12 @@ with tab_k:
             today = {"date": qd.strftime("%Y-%m-%d"), "open": q["open"], "high": q["high"],
                      "low": q["low"], "close": q["price"]}
     embed_html(kchart.build(df, r["cone"], up_c, down_c, STOP_REF, stop_label=STOP_LABEL, today=today, dark=is_dark(),
-                                 cost=(st.session_state.positions.get(code) or {}).get("cost"),
+                                 cost=(st.session_state.positions.get(code) or {}).get("cost"), view=N_VIEW,
                                  vol_unit={"TW": "張", "US": "股"}.get(market, "")), height=600)
     st.caption("藍色帶狀是未來 20 個交易日的 80% 機率區間（依近 60 日波動度估計），不是預言的走勢；"
                "虛線是停損參考；空心 K 棒是今天盤中暫定值，收盤資料更新後才納入評分。")
 
-show = len(df)
+show = max(N_VIEW, 20)
 
 with tab_chip:
     ch = r["chips"].tail(show)
