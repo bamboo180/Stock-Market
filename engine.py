@@ -170,8 +170,188 @@ def _yf(ticker: str, start: str) -> pd.DataFrame:
     }).dropna()
 
 
-def fetch_index(symbol: str, start: str) -> pd.DataFrame:
-    df = _yf(symbol, start)
+# ----------------------------------------------------------------------------
+# 櫃買指數：Yahoo 的 ^TWOII 常常沒有歷史資料，改成多個來源依序嘗試
+# ----------------------------------------------------------------------------
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+INDEX_STATUS: dict[str, str] = {}        # 最近一次各來源的結果，畫面上顯示用
+
+
+def _num(x) -> float:
+    try:
+        return float(str(x).replace(",", "").replace("+", "").strip())
+    except ValueError:
+        return np.nan
+
+
+def _tw_date(s) -> pd.Timestamp | None:
+    """115/10/30、2026/10/30、2026-10-30、20261030、1151030 都可以。"""
+    s = re.sub(r"<[^>]+>", "", str(s)).strip()
+    m = re.fullmatch(r"(\d{2,4})[/\-.](\d{1,2})[/\-.](\d{1,2})", s)
+    if m:
+        y, mo, d = (int(g) for g in m.groups())
+    elif re.fullmatch(r"\d{7,8}", s):
+        y, mo, d = int(s[:-4]), int(s[-4:-2]), int(s[-2:])
+    else:
+        return None
+    if y < 1911:
+        y += 1911
+    try:
+        return pd.Timestamp(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _ohlc_from_table(fields, rows) -> pd.DataFrame:
+    """從「日期／開市／最高／最低／收市」這類表格找出欄位（欄名不同也能對上）。"""
+    fields = [re.sub(r"<[^>]+>|\s", "", str(f)) for f in (fields or [])]
+
+    def col(*keys, default=None):
+        for i, f in enumerate(fields):
+            if any(k in f for k in keys):
+                return i
+        return default
+    i_d = col("日期", "Date", default=0)
+    i_o, i_h, i_l = col("開", "Open"), col("高", "High"), col("低", "Low")
+    i_c = col("收", "Close", "指數")
+    if i_c is None:                      # 沒欄名時：日期、開、高、低、收
+        i_o, i_h, i_l, i_c = 1, 2, 3, 4
+    out = []
+    for r in rows or []:
+        if not isinstance(r, (list, tuple)) or len(r) <= i_c:
+            continue
+        d = _tw_date(r[i_d])
+        c = _num(r[i_c])
+        if d is None or not np.isfinite(c):
+            continue
+        g = lambda i: _num(r[i]) if i is not None and i < len(r) else c
+        out.append({"date": d, "open": g(i_o), "high": g(i_h), "low": g(i_l), "close": c})
+    return pd.DataFrame(out)
+
+
+def _tables_in(j) -> list[tuple]:
+    """櫃買中心新舊網站的 JSON 格式不同：tables[].fields/data、aaData、data 都找。"""
+    found = []
+    if isinstance(j, dict):
+        for t in j.get("tables") or []:
+            if isinstance(t, dict) and t.get("data"):
+                found.append((t.get("fields"), t["data"]))
+        for k in ("aaData", "data"):
+            if isinstance(j.get(k), list) and j[k] and isinstance(j[k][0], (list, tuple)):
+                found.append((j.get("fields"), j[k]))
+    return found
+
+
+def _tpex_month(y: int, m: int, variant: int) -> pd.DataFrame:
+    if variant == 0:
+        r = requests.get("https://www.tpex.org.tw/www/zh-tw/indexInfo/inx",
+                         params={"date": f"{y}/{m:02d}/01", "response": "json"}, headers=UA, timeout=15)
+    elif variant == 1:
+        r = requests.post("https://www.tpex.org.tw/www/zh-tw/indexInfo/inx",
+                          data={"date": f"{y}/{m:02d}/01", "response": "json"}, headers=UA, timeout=15)
+    else:
+        r = requests.get("https://www.tpex.org.tw/web/stock/iNdex_info/inxh/Inx_result.php",
+                         params={"l": "zh-tw", "d": f"{y - 1911}/{m:02d}", "o": "json"}, headers=UA, timeout=15)
+    frames = [_ohlc_from_table(f, rows) for f, rows in _tables_in(r.json())]
+    frames = [f for f in frames if len(f)]
+    return max(frames, key=len) if frames else pd.DataFrame()
+
+
+def _tpex_site(start: str) -> pd.DataFrame:
+    from concurrent.futures import ThreadPoolExecutor
+    months = pd.period_range(pd.Timestamp(start), pd.Timestamp.today(), freq="M")
+    last = months[-1]
+    probe = [last, last - 1]                 # 月初時本月可能還沒資料
+    for v in range(3):                       # 先用最近的月份試出哪一種網址可用
+        ok = False
+        for p in probe:
+            try:
+                if len(_tpex_month(p.year, p.month, v)):
+                    ok = True
+                    break
+            except Exception:
+                continue
+        if not ok:
+            continue
+
+        def one(p, v=v):
+            try:
+                return _tpex_month(p.year, p.month, v)
+            except Exception:
+                return pd.DataFrame()
+        with ThreadPoolExecutor(8) as ex:
+            parts = [f for f in ex.map(one, months) if len(f)]
+        if parts:
+            return pd.concat(parts).drop_duplicates("date").sort_values("date")
+    return pd.DataFrame()
+
+
+def _finmind_index(data_id: str, start: str, token: str | None) -> tuple[pd.DataFrame, str]:
+    px = _finmind("TaiwanStockPrice", data_id, start, token)
+    if len(px) and "close" in px:
+        df = pd.DataFrame({"date": pd.to_datetime(px["date"]), "open": px["open"].astype(float),
+                           "high": px["max"].astype(float), "low": px["min"].astype(float),
+                           "close": px["close"].astype(float)})
+        return df, "FinMind"
+    # 報酬指數（含息）：只有收盤，水準不同 → 換算到證交所即時的櫃買指數，只看走勢用
+    tr = _finmind("TaiwanStockTotalReturnIndex", data_id, start, token)
+    if len(tr) and "price" in tr:
+        c = tr["price"].astype(float)
+        try:
+            import live
+            q = live.quotes_mis(["otc_o00.tw" if data_id == "TPEx" else "tse_t00.tw"])
+            now_px = next(iter(q.values()))["price"]
+            c = c * (now_px / float(c.iloc[-1]))
+        except Exception:
+            pass
+        return pd.DataFrame({"date": pd.to_datetime(tr["date"]), "open": c, "high": c, "low": c, "close": c}), \
+            "FinMind 報酬指數（換算）"
+    return pd.DataFrame(), ""
+
+
+def _fresh(df: pd.DataFrame, n: int = 20) -> bool:
+    return len(df) >= n and (pd.Timestamp.today() - df["date"].max()).days <= 10
+
+
+def fetch_tw_index(symbol: str, start: str, token: str | None = None) -> pd.DataFrame:
+    """台股指數（加權、櫃買）：依序試 FinMind → 櫃買中心／證交所網站 → Yahoo，用第一個有最新資料的。"""
+    fm_id = {"^TWII": "TAIEX", "^TWOII": "TPEx"}[symbol]
+    status, best = [], pd.DataFrame()
+    tries = [("Yahoo", lambda: _yf(symbol, start))] if symbol == "^TWII" else []
+    tries += [("FinMind", lambda: _finmind_index(fm_id, start, token))]
+    if symbol == "^TWOII":
+        tries += [("櫃買中心", lambda: _tpex_site(start))]
+    tries += [("Yahoo", lambda: _yf(symbol, start))] if symbol != "^TWII" else []
+    for name, fn in tries:
+        try:
+            res = fn()
+            df, src = res if isinstance(res, tuple) else (res, name)
+        except Exception as e:
+            status.append(f"{name} 失敗（{str(e)[:40]}）")
+            continue
+        if df is None or df.empty:
+            status.append(f"{name} 沒有資料")
+            continue
+        df = df[df["date"] >= pd.Timestamp(start)].dropna(subset=["close"])
+        if _fresh(df):
+            status.append(f"{src} ✓")
+            INDEX_STATUS[symbol] = "｜".join(status)
+            return df.assign(vol=df.get("vol", 0.0)).reset_index(drop=True)
+        status.append(f"{src} 資料不完整（{len(df)} 筆）")
+        if len(df) > len(best):
+            best = df
+    INDEX_STATUS[symbol] = "｜".join(status)
+    if len(best) >= 20:
+        return best.assign(vol=0.0).reset_index(drop=True)
+    raise DataError(f"抓不到{'櫃買' if symbol == '^TWOII' else '加權'}指數的歷史資料（{'｜'.join(status)}）。"
+                    "可以按「清除快取並重新抓取」再試一次。")
+
+
+def fetch_index(symbol: str, start: str, token: str | None = None) -> pd.DataFrame:
+    if symbol in ("^TWII", "^TWOII"):
+        df = fetch_tw_index(symbol, start, token)
+    else:
+        df = _yf(symbol, start)
     if df.empty:
         raise DataError(f"找不到指數 {symbol} 的資料，請確認是 Yahoo Finance 的代號（例如 ^TWII、^GSPC）。")
     df["bench"] = np.nan

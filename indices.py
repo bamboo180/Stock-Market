@@ -1,6 +1,8 @@
 """市場指數：走勢用 Yahoo Finance 日線，台股加權、櫃買盤中改用證交所即時值。"""
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 
 import live
@@ -30,6 +32,7 @@ CATALOG: dict[str, tuple[str, str, str | None]] = {
     "CL=F": ("原油期貨", "商品", None),
     "BTC-USD": ("比特幣", "加密", None),
 }
+_TW_CACHE: dict = {}
 DEFAULT = ["^TWII", "^TWOII", "^GSPC", "^IXIC", "^DJI", "^SOX"]
 
 
@@ -41,7 +44,7 @@ def is_tw(sym: str) -> bool:
     return CATALOG.get(sym, ("", ""))[1] == "TW"
 
 
-def fetch(symbols: list[str], spark_days: int = 22) -> dict[str, dict]:
+def fetch(symbols: list[str], spark_days: int = 22, token: str | None = None) -> dict[str, dict]:
     out: dict[str, dict] = {}
     if not symbols:
         return out
@@ -62,6 +65,25 @@ def fetch(symbols: list[str], spark_days: int = 22) -> dict[str, dict]:
                   "spark": [round(float(x), 2) for x in close.tail(spark_days)],
                   "date": close.index[-1].strftime("%Y%m%d"), "time": close.index[-1].strftime("%m/%d"),
                   "source": "Yahoo"}
+
+    # Yahoo 沒有走勢的台股指數（常見是櫃買 ^TWOII）→ 改用 FinMind／櫃買中心
+    for s in symbols:
+        if s in ("^TWII", "^TWOII") and len(out.get(s, {}).get("spark", [])) < 5:
+            try:
+                import engine
+                hit = _TW_CACHE.get(s)
+                if hit and time.time() - hit[0] < 1800:          # 歷史走勢 30 分鐘抓一次就好
+                    df = hit[1]
+                else:
+                    df = engine.fetch_tw_index(s, (pd.Timestamp.today() - pd.Timedelta(days=60)).strftime("%Y-%m-%d"), token)
+                    _TW_CACHE[s] = (time.time(), df)
+                close = df.set_index("date")["close"]
+                out[s] = {"price": float(close.iloc[-1]), "prev": float(close.iloc[-2]),
+                          "spark": [round(float(x), 2) for x in close.tail(spark_days)],
+                          "date": close.index[-1].strftime("%Y%m%d"), "time": close.index[-1].strftime("%m/%d"),
+                          "source": "FinMind／櫃買中心"}
+            except Exception:
+                pass
 
     # 台股指數：用證交所即時值（盤中約 5 秒延遲，收盤後為當日收盤）
     tw = {CATALOG[s][2]: s for s in symbols if s in CATALOG and CATALOG[s][2]}

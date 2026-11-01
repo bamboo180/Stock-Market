@@ -5,7 +5,9 @@ import concurrent.futures as cf
 import datetime as dt
 import logging
 import hmac
+import hashlib
 import inspect
+import json
 import os
 import re
 
@@ -14,6 +16,20 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+
+try:                                   # 我的最愛拖曳排序（沒裝套件時改用按鈕）
+    from streamlit_sortables import sort_items as SORTABLE
+except Exception:
+    SORTABLE = None
+SORT_CSS = """
+.sortable-component{border:none;padding:0;background:transparent;font-family:system-ui,'Microsoft JhengHei',sans-serif}
+.sortable-container{background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.25);border-radius:10px;
+  margin:0 0 10px;padding:4px 6px 8px;min-height:48px}
+.sortable-container-header{font-weight:700;padding:6px 6px 2px;color:#2f5bd3}
+.sortable-item{background:#ffffff;color:#222;border:1px solid rgba(128,128,128,.35);border-radius:8px;
+  padding:7px 12px;margin:5px 2px;cursor:grab;font-size:14px}
+.sortable-item:hover{border-color:#2f5bd3}
+"""
 
 import company
 import engine
@@ -28,7 +44,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.3（2026-10-31）"
+APP_VERSION = "v2.4（2026-11-01）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -68,6 +84,11 @@ st.markdown("""
 .live .row{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline}
 .live .px{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums}
 [data-testid="InputInstructions"]{display:none!important}
+/* 左上角 LOGO（點了回首頁） */
+.st-key-logo button{justify-content:flex-start;padding:2px 4px;margin:-8px 0 2px;border-radius:10px}
+.st-key-logo button p{font-size:1.32rem;font-weight:800;letter-spacing:.02em}
+.st-key-logo button:hover{background:rgba(128,128,128,.12)}
+.st-key-logo button span[data-testid="stIconMaterial"]{font-size:1.9rem;color:#2f5bd3}
 .lim{display:inline-block;color:#fff!important;padding:0 .4em;border-radius:5px;font-weight:700}
 .lim-up{background:#d1352b}.lim-down{background:#14825a}
 .lim-tag{display:inline-block;color:#fff;font-size:.75rem;font-weight:700;padding:1px 7px;border-radius:4px;margin-left:6px;vertical-align:middle}
@@ -200,7 +221,7 @@ def load(code: str, days: int, token: str | None):
         df = engine.fetch_tw(code, start, token or None)
         name = quick_name(code) or engine.tw_name(code, token or None)
     elif market == "IDX":
-        df = engine.fetch_index(code, start)
+        df = engine.fetch_index(code, start, token or None)
         name = quick_name(code)
     else:
         df = engine.fetch_us(code, start)
@@ -571,6 +592,8 @@ if "code" not in st.session_state:
     st.session_state.code = (st.session_state.favs or ["2330"])[0]
 
 with st.sidebar:
+    st.button("股票訊號看板", key="logo", icon=":material/candlestick_chart:", type="tertiary",
+              on_click=go_home, help="回到首頁（市場總覽）")
     st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed")
     search_box("search", "🔍 搜尋股票", on_search)
     if "period_pick" not in st.session_state:
@@ -590,7 +613,7 @@ with st.sidebar:
             if not g["codes"]:
                 continue
             if _multi:
-                st.markdown(f"<div class='small' style='margin:4px 0 -6px'>📁 {g['name']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='small' style='margin:10px 0 4px'>📁 {g['name']}</div>", unsafe_allow_html=True)
             cols = st.columns(2)
             for i, f in enumerate(g["codes"]):
                 cols[i % 2].button(f, key=f"fav_{f}", width="stretch", on_click=open_stock, args=(f,),
@@ -635,6 +658,19 @@ def fmt_chg(x):
     return "—" if x is None or pd.isna(x) else f"{'▲' if x > 0 else '▼' if x < 0 else ''}{x * 100:+.2f}%"
 
 
+def fmt_move(price, prev, chg=None) -> str:
+    """▼-0.40（-4.46%）：漲跌點數加百分比。"""
+    if chg is None and price and prev:
+        chg = price / prev - 1
+    if chg is None or pd.isna(chg):
+        return "—"
+    arrow = "▲" if chg > 0 else "▼" if chg < 0 else ""
+    if not prev or pd.isna(prev):
+        return f"{arrow}{chg * 100:+.2f}%"
+    d = price - prev
+    return f"{arrow}{d:+,.2f}（{chg * 100:+.2f}%）"
+
+
 # ============================================================================
 # 頁面一：我的最愛總覽
 # ============================================================================
@@ -645,7 +681,7 @@ if st.session_state.nav == HOME:
     # ---------- 市場指數 ----------
     @st.cache_data(ttl=60, show_spinner=False)
     def get_indices(syms: tuple):
-        return indices.fetch(list(syms))
+        return indices.fetch(list(syms), token=SAVED_TOKEN)
 
     def on_indices_change():
         chosen = []
@@ -665,7 +701,7 @@ if st.session_state.nav == HOME:
             st.caption("還沒有選指數，展開下方「調整指數」加入。")
             return
         data = get_indices(tuple(syms))
-        per_row = 6
+        per_row = 3              # 一列 3 張，漲跌點數與百分比才放得下
         for i in range(0, len(syms), per_row):
             cols = st.columns(per_row)
             for col, sym in zip(cols, syms[i:i + per_row]):
@@ -676,7 +712,7 @@ if st.session_state.nav == HOME:
                         continue
                     v = d["price"]
                     st.metric(indices.name_of(sym), f"{v:,.0f}" if v >= 10000 else f"{v:,.2f}",
-                              None if d["chg"] is None else f"{d['chg'] * 100:+.2f}%",
+                              None if d["chg"] is None else f"{d['price'] - d['prev']:+,.2f} ({d['chg'] * 100:+.2f}%)",
                               delta_color="inverse" if indices.is_tw(sym) else "normal",
                               chart_data=d["spark"] or None, chart_type="area", border=True,
                               help=f"{sym}｜{d['source']} {d['time']}")
@@ -826,9 +862,44 @@ if st.session_state.nav == HOME:
         b1, b2 = st.columns([3, 1.4], vertical_alignment="bottom")
         b1.text_input("新增群組", key="new_group", placeholder="輸入群組名稱，例如：半導體、存股、觀察中")
         b2.button("＋ 建立群組", on_click=group_add, width="stretch")
-        st.caption("↑↓ 調整順序（移到群組最上／最下再按一次，會移到上一個／下一個群組）；"
-                   "「移到」可直接換群組；群組名稱改完按 Enter。")
-        for gi, g in enumerate(st.session_state.groups):
+        btn_mode = SORTABLE is None or st.toggle("改用按鈕調整順序（手機上拖曳不方便時用）", key="btn_mode")
+        if not btn_mode:
+            st.markdown("**拖曳排序**：按住股票拖到想要的位置，也可以直接拖到別的群組，放開就會儲存。")
+            _items = [{"header": f"📁 {g['name']}", "items": [f"{c}　{quick_name(c)}".strip() for c in g["codes"]]}
+                      for g in st.session_state.groups]
+            _sig = hashlib.md5(json.dumps(st.session_state.groups, ensure_ascii=False).encode()).hexdigest()[:10]
+            _res = SORTABLE(_items, multi_containers=True, direction="vertical", custom_style=SORT_CSS,
+                            key=f"sort_{_sig}")
+            if _res and _res != _items:
+                by_header = {f"📁 {g['name']}": g["name"] for g in st.session_state.groups}
+                st.session_state.groups = [{"name": by_header.get(x["header"], x["header"].replace("📁 ", "")),
+                                            "codes": [str(it).split("　")[0].strip() for it in x["items"]]}
+                                           for x in _res]
+                save_favs()
+                st.rerun()
+            st.markdown("**群組設定**（名稱改完按 Enter）")
+            for gi, g in enumerate(st.session_state.groups):
+                h1, h2, h3, h4 = st.columns([4, 1, 1, 1.4], vertical_alignment="bottom")
+                h1.text_input("群組名稱", value=g["name"], key=f"gname_{g['name']}", on_change=group_rename,
+                              args=(g["name"],), label_visibility="collapsed")
+                h2.button("↑", key=f"gup_{g['name']}", on_click=group_move, args=(g["name"], -1),
+                          disabled=gi == 0, width="stretch", help="群組上移")
+                h3.button("↓", key=f"gdn_{g['name']}", on_click=group_move, args=(g["name"], 1),
+                          disabled=gi == len(st.session_state.groups) - 1, width="stretch", help="群組下移")
+                h4.button("刪除群組", key=f"gdel_{g['name']}", on_click=group_delete, args=(g["name"],),
+                          disabled=len(st.session_state.groups) <= 1, width="stretch",
+                          help="群組裡的股票會移到第一個群組，不會被刪掉")
+            if st.session_state.favs:
+                r1, r2 = st.columns([4, 1.4], vertical_alignment="bottom")
+                _rm = r1.selectbox("從最愛移除", st.session_state.favs, index=None, key="rm_pick",
+                                   format_func=lambda c: f"{c}　{quick_name(c)}", placeholder="選擇要移除的股票")
+                if r2.button("移除", width="stretch", disabled=not _rm):
+                    remove_fav(_rm)
+                    st.rerun()
+        else:
+            st.caption("↑↓ 調整順序（移到群組最上／最下再按一次，會移到上一個／下一個群組）；"
+                       "「移到」可直接換群組；群組名稱改完按 Enter。")
+        for gi, g in enumerate(st.session_state.groups if btn_mode else []):
             with st.container(border=True):
                 h1, h2, h3, h4 = st.columns([4, 1, 1, 1.4], vertical_alignment="bottom")
                 h1.text_input("群組名稱", value=g["name"], key=f"gname_{g['name']}", on_change=group_rename,
@@ -1191,7 +1262,7 @@ def live_card():
         f"<div class='live'><div class='small'><span class='dot' style='background:{dot}'></span>"
         f"{'盤中即時' if opened else '最新報價'}｜{q['source']} {q['time']}</div>"
         f"<div class='row'><span class='px'>{price_html(q['price'], live.limit_state(q['price'], q.get('prev'), market, q), chg_col)}</span>"
-        f"<span style='color:{chg_col};font-weight:600'>{fmt_chg(q['chg'])}</span>"
+        f"<span style='color:{chg_col};font-weight:600'>{fmt_move(q['price'], q.get('prev'), q['chg'])}</span>"
         f"<span class='small'>{hl}</span><span class='small'>{'　'.join(notes)}</span></div></div>",
         unsafe_allow_html=True)
 
@@ -1206,7 +1277,8 @@ def card(col, lbl, val, sub="", color="inherit", sub_color="gray"):
 
 c1, c2, c3, c4, c5 = st.columns([1, 1.3, 1.2, 1, 1])
 chg_c = up_c if r["chg"] > 0 else down_c if r["chg"] < 0 else "gray"
-card(c1, "收盤價（分析基準）", f"{r['close']:,.2f}", f"{r['chg'] * 100:+.2f}%（{cur}）", sub_color=chg_c)
+card(c1, "收盤價（分析基準）", f"{r['close']:,.2f}",
+     f"{r['close'] - r['close'] / (1 + r['chg']):+,.2f}（{r['chg'] * 100:+.2f}%）{cur}", sub_color=chg_c)
 def prob_card(col, title, h):
     if not h:
         card(col, title, "—", "資料不足")
