@@ -25,10 +25,15 @@ SORT_CSS = """
 .sortable-component{border:none;padding:0;background:transparent;font-family:system-ui,'Microsoft JhengHei',sans-serif}
 .sortable-container{background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.25);border-radius:10px;
   margin:0 0 10px;padding:4px 6px 8px;min-height:48px}
-.sortable-container-header{font-weight:700;padding:6px 6px 2px;color:#2f5bd3}
-.sortable-item{background:#ffffff;color:#222;border:1px solid rgba(128,128,128,.35);border-radius:8px;
-  padding:7px 12px;margin:5px 2px;cursor:grab;font-size:14px}
-.sortable-item:hover{border-color:#2f5bd3}
+.sortable-container-header{font-weight:700;padding:6px 6px 4px;color:#2f5bd3}
+.sortable-container-body{gap:0!important;padding:0!important}
+.sortable-item{background:#ffffff;color:#222;border:1px solid rgba(128,128,128,.30);border-radius:0;
+  padding:9px 12px;margin:0 0 -1px 0!important;cursor:grab;font-size:14px;line-height:20px;text-align:left}
+.sortable-item:first-child{border-radius:8px 8px 0 0}
+.sortable-item:last-child{border-radius:0 0 8px 8px}
+.sortable-item:only-child{border-radius:8px}
+.sortable-item,.sortable-item.active,.sortable-item:focus{background:#ffffff!important;color:#222!important;outline:none}
+.sortable-item:hover{background:#eef3ff!important}
 """
 
 import company
@@ -44,7 +49,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.7（2026-11-02）"
+APP_VERSION = "v2.8（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -535,6 +540,8 @@ def toggle_fav(code: str):
 
 
 def open_stock(code: str):
+    st.session_state.manage_open = False
+    st.session_state.collapse_sb = True        # 手機上選完自動收起左側選單
     st.session_state.code = code
     st.session_state.nav = STOCK
     st.session_state.jump = True      # 從 fragment 裡的按鈕觸發時，需要整頁重跑才會換頁
@@ -542,11 +549,19 @@ def open_stock(code: str):
 
 def go_home():
     st.session_state.nav = HOME
+    st.session_state.collapse_sb = True
+
+
+def on_nav_change():
+    st.session_state.collapse_sb = True
+    if st.session_state.nav != HOME:
+        st.session_state.manage_open = False
 
 
 def open_manage():
     st.session_state.nav = HOME
     st.session_state.manage_open = True
+    st.session_state.collapse_sb = True
 
 
 def drag_editor(prefix: str):
@@ -559,7 +574,10 @@ def drag_editor(prefix: str):
     items = [{"header": f"📁 {g['name']}", "items": [f"{c}　{quick_name(c)}".strip() for c in g["codes"]]}
              for g in groups]
     sig = hashlib.md5(json.dumps(groups, ensure_ascii=False).encode()).hexdigest()[:8]
-    res = SORTABLE(items, multi_containers=True, direction="vertical", custom_style=SORT_CSS,
+    # 高度固定成「全部股票都在同一組」時的高度：拖曳中區塊不會忽大忽小，項目才不會在滑鼠下亂跳
+    n_all = sum(len(g["codes"]) for g in groups)
+    fixed = f".sortable-component{{min-height:{60 + n_all * 39 + 24}px}}"
+    res = SORTABLE(items, multi_containers=True, direction="vertical", custom_style=SORT_CSS + fixed,
                    key=f"sort_{prefix}_{sig}_{st.session_state.get(reset_key, 0)}")
     by_header = {f"📁 {g['name']}": g["name"] for g in groups}
     if res and res != items:
@@ -609,7 +627,6 @@ def side_fav_list():
                 return
             st.session_state.groups.append({"name": name, "codes": []})
             save_favs()
-            st.session_state.pop("manage_open", None)
             st.session_state.side_group = name
             st.toast(f"已建立群組「{name}」，可以用「排序／移動」把股票拖進來")
         st.button("建立", key="side_new_ok", type="primary", width="stretch", on_click=_create)
@@ -751,7 +768,7 @@ if "code" not in st.session_state:
 with st.sidebar:
     st.button("股票訊號看板", key="logo", icon=":material/candlestick_chart:", type="tertiary",
               on_click=go_home, help="回到首頁（市場總覽）")
-    st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed")
+    st.radio("頁面", VIEWS, key="nav", label_visibility="collapsed", on_change=on_nav_change)
     search_box("search", "🔍 搜尋股票", on_search)
     if "period_pick" not in st.session_state:
         st.session_state.period_pick, st.session_state.period_days = DEFAULT_PERIOD, PERIODS[DEFAULT_PERIOD]
@@ -785,6 +802,28 @@ with st.sidebar:
     st.caption(f"版本 {APP_VERSION}")
 
 st.session_state.pop("jump", None)
+if st.session_state.pop("collapse_sb", False):
+    # 只有手機（窄螢幕、側邊欄是蓋在畫面上的）才自動收起；電腦上側邊欄保持打開
+    import streamlit.components.v1 as _components
+    st.session_state._collapse_n = st.session_state.get("_collapse_n", 0) + 1
+    _components.html(f"<!-- {st.session_state._collapse_n} -->" + """<script>
+    (function () {
+      try {
+        const w = window.parent, d = w.document;
+        if (w.innerWidth >= 768) return;
+        const sb = d.querySelector('[data-testid="stSidebar"]');
+        if (!sb) return;
+        const r = sb.getBoundingClientRect();
+        const open = sb.getAttribute('data-collapsed') === 'false' || sb.getAttribute('aria-expanded') === 'true'
+                     || (r.width > 50 && r.right > 50);
+        if (!open) return;
+        const btn = d.querySelector('[data-testid="stSidebarCollapseButton"] button')
+                 || d.querySelector('button[aria-label="Collapse sidebar"]')
+                 || d.querySelector('[data-testid="stSidebarHeader"] button');
+        if (btn) btn.click();
+      } catch (e) {}
+    })();
+    </script>""", height=0)
 _want = {"v": QP_KEY[st.session_state.nav]}
 if st.session_state.nav == STOCK:
     _want["s"] = st.session_state.code
@@ -1005,7 +1044,8 @@ if st.session_state.nav == HOME:
 
     fav_board()
 
-    with st.expander("管理清單（群組、排序）", expanded=bool(st.session_state.pop("manage_open", False))):
+    # expanded 參數每次都要一樣，否則 Streamlit 會把面板重建成收起來 → 頁面跳回最上面
+    with st.expander("管理清單（群組、排序）", expanded=bool(st.session_state.get("manage_open", False))):
         _gn = group_names()
         a1, a2 = st.columns([3, 1.4], vertical_alignment="bottom")
         with a1:
@@ -1018,9 +1058,14 @@ if st.session_state.nav == HOME:
         b2.button("＋ 建立群組", on_click=group_add, width="stretch")
         btn_mode = SORTABLE is None or st.toggle("改用按鈕調整順序（手機上拖曳不方便時用）", key="btn_mode")
         if not btn_mode:
-            st.markdown("**拖曳排序**：按住股票拖到想要的位置，也可以直接拖到別的群組，調整完按「確認」才會儲存。")
-            if drag_editor("home"):
-                st.rerun()
+            if st.session_state.get("home_edit"):
+                st.markdown("**拖曳排序**：按住股票拖到想要的位置，也可以直接拖到別的群組，調整完按「確認」才會儲存。")
+                if drag_editor("home"):
+                    st.session_state.home_edit = False
+                    st.rerun()
+            else:
+                st.button("排序／移動（拖曳）", key="home_edit_btn", icon=":material/swap_vert:",
+                          on_click=lambda: st.session_state.update(home_edit=True, manage_open=True))
             st.markdown("**群組設定**（名稱改完按 Enter）")
             for gi, g in enumerate(st.session_state.groups):
                 h1, h2, h3, h4 = st.columns([4, 1, 1, 1.4], vertical_alignment="bottom")
