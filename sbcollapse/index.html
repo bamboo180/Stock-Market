@@ -1,0 +1,34 @@
+<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0">
+<script>
+// 手機（窄螢幕，側邊欄蓋在畫面上）選完之後自動收起左側選單；電腦上不動作
+(function () {
+  function send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*"); }
+  let lastNonce = null;
+  function collapse() {
+    try {
+      const w = window.parent, d = w.document;
+      if (w.innerWidth >= 768) return;
+      const sb = d.querySelector('[data-testid="stSidebar"]');
+      if (!sb) return;
+      const r = sb.getBoundingClientRect();
+      const open = sb.getAttribute('data-collapsed') === 'false' || sb.getAttribute('aria-expanded') === 'true'
+                   || (r.width > 50 && r.right > 50);
+      if (!open) return;
+      const btn = d.querySelector('[data-testid="stSidebarCollapseButton"] button')
+               || d.querySelector('button[aria-label="Collapse sidebar"]')
+               || d.querySelector('[data-testid="stSidebarHeader"] button');
+      if (btn) btn.click();
+    } catch (e) {}
+  }
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    const n = (e.data.args || {}).nonce;
+    if (n !== lastNonce) { lastNonce = n; collapse(); }
+    send("streamlit:setFrameHeight", { height: 0 });
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+})();
+</script>
+</body></html>

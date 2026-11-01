@@ -17,24 +17,10 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-try:                                   # 我的最愛拖曳排序（沒裝套件時改用按鈕）
-    from streamlit_sortables import sort_items as SORTABLE
-except Exception:
-    SORTABLE = None
-SORT_CSS = """
-.sortable-component{border:none;padding:0;background:transparent;font-family:system-ui,'Microsoft JhengHei',sans-serif}
-.sortable-container{background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.25);border-radius:10px;
-  margin:0 0 10px;padding:4px 6px 8px;min-height:48px}
-.sortable-container-header{font-weight:700;padding:6px 6px 4px;color:#2f5bd3}
-.sortable-container-body{gap:0!important;padding:0!important}
-.sortable-item{background:#ffffff;color:#222;border:1px solid rgba(128,128,128,.30);border-radius:0;
-  padding:9px 12px;margin:0 0 -1px 0!important;cursor:grab;font-size:14px;line-height:20px;text-align:left}
-.sortable-item:first-child{border-radius:8px 8px 0 0}
-.sortable-item:last-child{border-radius:0 0 8px 8px}
-.sortable-item:only-child{border-radius:8px}
-.sortable-item,.sortable-item.active,.sortable-item:focus{background:#ffffff!important;color:#222!important;outline:none}
-.sortable-item:hover{background:#eef3ff!important}
-"""
+# 我的最愛拖曳排序：自己的小元件（favsort 資料夾，內含 SortableJS），不用另外安裝套件
+import streamlit.components.v1 as _cv1
+FAVSORT = _cv1.declare_component("favsort", path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "favsort"))
+SBCOLLAPSE = _cv1.declare_component("sbcollapse", path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "sbcollapse"))
 
 import company
 import engine
@@ -49,7 +35,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.8（2026-11-02）"
+APP_VERSION = "v2.9（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -250,6 +236,12 @@ def name_table() -> dict:
     return out
 
 
+def nice_name(code: str) -> str:
+    """名稱；查不到（或是 NaN）時回傳空字串。"""
+    n = quick_name(code)
+    return n if isinstance(n, str) and n.lower() != "nan" else ""
+
+
 def quick_name(code: str) -> str:
     if engine.is_index(code):
         n = indices.name_of(code)
@@ -432,34 +424,45 @@ def group_names() -> list[str]:
 
 
 def group_of(code: str) -> str | None:
+    """第一個含有這檔股票的群組。"""
     return next((g["name"] for g in st.session_state.groups if code in g["codes"]), None)
+
+
+def groups_of(code: str) -> list[str]:
+    """含有這檔股票的所有群組（同一檔可以在好幾個群組）。"""
+    return [g["name"] for g in st.session_state.groups if code in g["codes"]]
 
 
 def _grp(name: str) -> dict | None:
     return next((g for g in st.session_state.groups if g["name"] == name), None)
 
 
+def current_group() -> str | None:
+    """左側欄下拉選單目前選的群組；選「全部」時回傳 None。"""
+    g = st.session_state.get("side_group")
+    return g if g in group_names() else None
+
+
 def fav_add(code: str, group: str | None = None):
-    if code in st.session_state.favs:
-        return
+    """加到指定群組（已經在那個群組就不重複加）；沒指定就加到第一個群組。"""
     g = _grp(group or "") or st.session_state.groups[0]
-    g["codes"].append(code)
-    save_favs()
+    if code not in g["codes"]:
+        g["codes"].append(code)
+        save_favs()
 
 
-def fav_remove(code: str):
+def fav_remove(code: str, group: str | None = None):
+    """指定群組就只從那個群組移除；沒指定就從所有群組移除。"""
     for g in st.session_state.groups:
-        if code in g["codes"]:
+        if (group is None or g["name"] == group) and code in g["codes"]:
             g["codes"].remove(code)
     save_favs()
 
 
-def fav_move(code: str, step: int):
+def fav_move(code: str, step: int, group: str):
     """在群組內上移（-1）或下移（+1）；到頂／到底時移到上一個／下一個群組。"""
     gs = st.session_state.groups
-    gi = next((i for i, g in enumerate(gs) if code in g["codes"]), None)
-    if gi is None:
-        return
+    gi = group_names().index(group)
     lst = gs[gi]["codes"]
     i = lst.index(code)
     j = i + step
@@ -468,17 +471,17 @@ def fav_move(code: str, step: int):
     elif 0 <= gi + step < len(gs):
         lst.remove(code)
         nxt = gs[gi + step]["codes"]
-        nxt.append(code) if step < 0 else nxt.insert(0, code)
+        if code not in nxt:
+            nxt.append(code) if step < 0 else nxt.insert(0, code)
     save_favs()
 
 
-def fav_to_group(code: str):
-    target = st.session_state.get(f"mv_{code}")
-    if target and target != group_of(code):
-        for g in st.session_state.groups:
-            if code in g["codes"]:
-                g["codes"].remove(code)
-        _grp(target)["codes"].append(code)
+def fav_to_group(code: str, group: str, wkey: str):
+    target = st.session_state.get(wkey)
+    if target and target != group:
+        _grp(group)["codes"].remove(code)
+        if code not in _grp(target)["codes"]:
+            _grp(target)["codes"].append(code)
         save_favs()
 
 
@@ -530,13 +533,22 @@ def group_delete(name: str):
 
 
 def toggle_fav(code: str):
-    if code in st.session_state.favs:
-        fav_remove(code)
-        st.toast(f"已從最愛移除 {code}")
+    """依左側選中的群組判斷：在這個群組裡就移除，不在就加進這個群組。"""
+    g = current_group()
+    if g is None:                                   # 「全部」：在任何群組就全部移除
+        if code in st.session_state.favs:
+            fav_remove(code)
+            st.toast(f"已從所有群組移除 {code}")
+        else:
+            fav_add(code, st.session_state.get("add_group"))
+            st.toast(f"已加入最愛 {code}（{group_of(code)}）")
+        return
+    if code in _grp(g)["codes"]:
+        fav_remove(code, g)
+        st.toast(f"已從「{g}」移除 {code}")
     else:
-        g = st.session_state.get("add_group")
         fav_add(code, g)
-        st.toast(f"已加入最愛 {code}（{group_of(code)}）")
+        st.toast(f"已加入「{g}」：{code}")
 
 
 def open_stock(code: str):
@@ -566,25 +578,17 @@ def open_manage():
 
 def drag_editor(prefix: str):
     """拖曳排序（可跨群組）。拖完先暫存，按「確認」才儲存，按「取消」還原。"""
-    if SORTABLE is None:
-        st.caption("拖曳功能需要 streamlit-sortables 套件（啟動.bat 會自動安裝），目前請到首頁「管理清單」用按鈕調整。")
-        return False
     groups = st.session_state.groups
     pend_key, reset_key = f"{prefix}_pending", f"{prefix}_reset"
-    items = [{"header": f"📁 {g['name']}", "items": [f"{c}　{quick_name(c)}".strip() for c in g["codes"]]}
-             for g in groups]
-    sig = hashlib.md5(json.dumps(groups, ensure_ascii=False).encode()).hexdigest()[:8]
-    # 高度固定成「全部股票都在同一組」時的高度：拖曳中區塊不會忽大忽小，項目才不會在滑鼠下亂跳
-    n_all = sum(len(g["codes"]) for g in groups)
-    fixed = f".sortable-component{{min-height:{60 + n_all * 39 + 24}px}}"
-    res = SORTABLE(items, multi_containers=True, direction="vertical", custom_style=SORT_CSS + fixed,
-                   key=f"sort_{prefix}_{sig}_{st.session_state.get(reset_key, 0)}")
-    by_header = {f"📁 {g['name']}": g["name"] for g in groups}
-    if res and res != items:
-        st.session_state[pend_key] = [{"name": by_header.get(x["header"], x["header"].replace("📁 ", "")),
-                                       "codes": [str(it).split("　")[0].strip() for it in x["items"]]} for x in res]
-    elif res == items:
-        st.session_state.pop(pend_key, None)
+    args = [{"name": g["name"], "items": [{"code": c, "name": nice_name(c)} for c in g["codes"]]} for g in groups]
+    res = FAVSORT(groups=args, key=f"favsort_{prefix}_{st.session_state.get(reset_key, 0)}", default=None)
+    committed = [{"name": g["name"], "codes": list(g["codes"])} for g in groups]
+    if res and isinstance(res, dict) and res.get("groups") is not None:
+        new = [{"name": x["name"], "codes": list(x["codes"])} for x in res["groups"]]
+        if new != committed and [x["name"] for x in new] == [x["name"] for x in committed]:
+            st.session_state[pend_key] = new
+        else:
+            st.session_state.pop(pend_key, None)
     pending = st.session_state.get(pend_key)
     if pending:
         st.info("已調整順序，按「確認」才會儲存。")
@@ -651,8 +655,7 @@ def side_fav_list():
     for c in codes:
         mk = market_of(c)
         up, down = colors(mk, c)
-        nm = quick_name(c)
-        nm = "" if not isinstance(nm, str) or nm.lower() == "nan" else nm
+        nm = nice_name(c)
         qq = q.get(c) or {}
         px, prev, ch = qq.get("price"), qq.get("prev"), qq.get("chg")
         if px:
@@ -785,7 +788,7 @@ with st.sidebar:
     else:
         st.markdown("**⭐ 我的最愛**")
         st.caption("還沒有收藏。到個股頁按「☆ 加入最愛」。")
-    if st.session_state.favs and not st.session_state.get("side_edit") and SORTABLE is not None:
+    if st.session_state.favs and not st.session_state.get("side_edit"):
         st.button("排序／移動", key="side_edit_btn", icon=":material/swap_vert:", type="tertiary",
                   on_click=lambda: st.session_state.update(side_edit=True),
                   help="拖曳調整順序或移到別的群組，按確認才儲存")
@@ -803,27 +806,9 @@ with st.sidebar:
 
 st.session_state.pop("jump", None)
 if st.session_state.pop("collapse_sb", False):
-    # 只有手機（窄螢幕、側邊欄是蓋在畫面上的）才自動收起；電腦上側邊欄保持打開
-    import streamlit.components.v1 as _components
+    # 只有手機（窄螢幕、側邊欄蓋在畫面上）才自動收起；電腦上側邊欄保持打開
     st.session_state._collapse_n = st.session_state.get("_collapse_n", 0) + 1
-    _components.html(f"<!-- {st.session_state._collapse_n} -->" + """<script>
-    (function () {
-      try {
-        const w = window.parent, d = w.document;
-        if (w.innerWidth >= 768) return;
-        const sb = d.querySelector('[data-testid="stSidebar"]');
-        if (!sb) return;
-        const r = sb.getBoundingClientRect();
-        const open = sb.getAttribute('data-collapsed') === 'false' || sb.getAttribute('aria-expanded') === 'true'
-                     || (r.width > 50 && r.right > 50);
-        if (!open) return;
-        const btn = d.querySelector('[data-testid="stSidebarCollapseButton"] button')
-                 || d.querySelector('button[aria-label="Collapse sidebar"]')
-                 || d.querySelector('[data-testid="stSidebarHeader"] button');
-        if (btn) btn.click();
-      } catch (e) {}
-    })();
-    </script>""", height=0)
+    SBCOLLAPSE(nonce=st.session_state._collapse_n, key=f"sbc_{st.session_state._collapse_n}", default=None)
 _want = {"v": QP_KEY[st.session_state.nav]}
 if st.session_state.nav == STOCK:
     _want["s"] = st.session_state.code
@@ -967,7 +952,7 @@ if st.session_state.nav == HOME:
         rows, order = [], []
         prog = st.empty()
         for i, c in enumerate(favs):
-            row = {"代號": c, "名稱": "", **({"群組": group_of(c)} if fav_view == "全部" and len(_gn) > 1 else {}), "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
+            row = {"代號": c, "名稱": "", **({"群組": "、".join(groups_of(c))} if fav_view == "全部" and len(_gn) > 1 else {}), "市場": {"TW": "台股", "IDX": "指數"}.get(market_of(c), "美股"),
                    "現價": None, "漲跌": "—", "明日漲機率": None, "10日漲機率": None, "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
                 try:
@@ -1056,7 +1041,7 @@ if st.session_state.nav == HOME:
         b1, b2 = st.columns([3, 1.4], vertical_alignment="bottom")
         b1.text_input("新增群組", key="new_group", placeholder="輸入群組名稱，例如：半導體、存股、觀察中")
         b2.button("＋ 建立群組", on_click=group_add, width="stretch")
-        btn_mode = SORTABLE is None or st.toggle("改用按鈕調整順序（手機上拖曳不方便時用）", key="btn_mode")
+        btn_mode = st.toggle("改用按鈕調整順序（手機上拖曳不方便時用）", key="btn_mode")
         if not btn_mode:
             if st.session_state.get("home_edit"):
                 st.markdown("**拖曳排序**：按住股票拖到想要的位置，也可以直接拖到別的群組，調整完按「確認」才會儲存。")
@@ -1080,7 +1065,7 @@ if st.session_state.nav == HOME:
                           help="群組裡的股票會移到第一個群組，不會被刪掉")
             if st.session_state.favs:
                 r1, r2 = st.columns([4, 1.4], vertical_alignment="bottom")
-                _rm = r1.selectbox("從最愛移除", st.session_state.favs, index=None, key="rm_pick",
+                _rm = r1.selectbox("從所有群組移除", st.session_state.favs, index=None, key="rm_pick",
                                    format_func=lambda c: f"{c}　{quick_name(c)}", placeholder="選擇要移除的股票")
                 if r2.button("移除", width="stretch", disabled=not _rm):
                     remove_fav(_rm)
@@ -1105,13 +1090,15 @@ if st.session_state.nav == HOME:
                 for c in g["codes"]:
                     x, u, d_, mv, y = st.columns([3, 0.8, 0.8, 2, 1], vertical_alignment="center")
                     x.markdown(f"**{c}** <span class='small'>{quick_name(c)}</span>", unsafe_allow_html=True)
-                    u.button("↑", key=f"up_{c}", on_click=fav_move, args=(c, -1), width="stretch")
-                    d_.button("↓", key=f"dn_{c}", on_click=fav_move, args=(c, 1), width="stretch")
+                    u.button("↑", key=f"up_{gi}_{c}", on_click=fav_move, args=(c, -1, g["name"]), width="stretch")
+                    d_.button("↓", key=f"dn_{gi}_{c}", on_click=fav_move, args=(c, 1, g["name"]), width="stretch")
                     if len(st.session_state.groups) > 1:
-                        st.session_state[f"mv_{c}"] = g["name"]
-                        mv.selectbox("移到", _gn, key=f"mv_{c}", on_change=fav_to_group, args=(c,),
+                        _wk = f"mv_{gi}_{c}"
+                        st.session_state[_wk] = g["name"]
+                        mv.selectbox("移到", _gn, key=_wk, on_change=fav_to_group, args=(c, g["name"], _wk),
                                      label_visibility="collapsed")
-                    y.button("移除", key=f"rm_{c}", on_click=remove_fav, args=(c,), width="stretch")
+                    y.button("移除", key=f"rm_{gi}_{c}", on_click=fav_remove, args=(c, g["name"]), width="stretch",
+                             help=f"只從「{g['name']}」移除")
 
     st.caption("本工具為個人研究用技術原型，不構成投資建議。")
     st.stop()
@@ -1401,7 +1388,8 @@ SESSION = live.session_of(code, market)
 df, last = r["df"], r["last"]
 cur = {"TW": "NT$", "US": "US$"}.get(market, "點")
 mk_label = {"TW": "台股", "US": "美股", "IDX": "指數"}[market]
-is_fav = code in st.session_state.favs
+CUR_G = current_group()                       # 左側欄選中的群組（選「全部」時為 None）
+is_fav = code in (_grp(CUR_G)["codes"] if CUR_G else st.session_state.favs)
 held = st.session_state.positions.get(code)
 _q0 = get_quotes((code,)).get(code)
 pos_p = pos_analyze(df, r, _q0["price"] if _q0 else r["close"], held) if held else None
@@ -1409,9 +1397,17 @@ STOP_REF, STOP_LABEL = (pos_p["stop"], "我的停損") if pos_p else (r["stop"],
 
 t1, t2 = st.columns([5, 1.2], vertical_alignment="center")
 t1.title(f"{code} {name}".strip())
-if is_fav:
+if CUR_G:                                      # 依目前群組判斷：不在這個群組就顯示「加入」
+    if is_fav:
+        t2.button("★ 已在最愛", on_click=toggle_fav, args=(code,), type="primary", width="stretch",
+                  help=f"在「{CUR_G}」群組，再按一次從「{CUR_G}」移除")
+    else:
+        t2.button("☆ 加入最愛", on_click=toggle_fav, args=(code,), width="stretch",
+                  help=f"加到「{CUR_G}」群組（左側欄可切換群組）")
+    t2.caption(f"📁 {CUR_G}")
+elif is_fav:
     t2.button("★ 已在最愛", on_click=toggle_fav, args=(code,), type="primary", width="stretch",
-              help=f"在「{group_of(code)}」群組，再按一次移除")
+              help=f"在「{'、'.join(groups_of(code))}」，按一次從所有群組移除")
 elif len(st.session_state.groups) == 1:
     t2.button("☆ 加入最愛", on_click=fav_add, args=(code,), width="stretch")
 else:

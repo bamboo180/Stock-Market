@@ -27,7 +27,8 @@ DEFAULT_GROUP = "我的最愛"
 
 
 def clean_groups(groups, extra=None) -> list[dict]:
-    """群組清單：[{"name": 名稱, "codes": [代號…]}]。名稱不重複、每檔股票只屬於一個群組、順序保留。"""
+    """群組清單：[{"name": 名稱, "codes": [代號…]}]。名稱不重複、同一群組內不重複、順序保留。
+    同一檔股票可以同時放在好幾個群組（「全部」顯示時只出現一次）。"""
     out, seen_code, seen_name = [], set(), set()
     for g in groups or []:
         if not isinstance(g, dict):
@@ -37,11 +38,8 @@ def clean_groups(groups, extra=None) -> list[dict]:
         while name in seen_name:
             name, k = f"{base} {k}", k + 1
         seen_name.add(name)
-        codes = []
-        for c in _clean(g.get("codes")):
-            if c not in seen_code:
-                seen_code.add(c)
-                codes.append(c)
+        codes = _clean(g.get("codes"))           # _clean 已經去掉同一群組內的重複
+        seen_code.update(codes)
         out.append({"name": name, "codes": codes})
     if not out:
         out = [{"name": DEFAULT_GROUP, "codes": []}]
@@ -53,7 +51,8 @@ def clean_groups(groups, extra=None) -> list[dict]:
 
 
 def flatten(groups) -> list[str]:
-    return [c for g in groups for c in g["codes"]]
+    """全部群組合起來，重複的只留第一次出現的。"""
+    return list(dict.fromkeys(c for g in groups for c in g["codes"]))
 
 
 def _normalize(data) -> dict:
