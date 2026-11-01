@@ -44,7 +44,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.4（2026-11-01）"
+APP_VERSION = "v2.5（2026-11-01）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -52,18 +52,41 @@ logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.E
 
 
 @st.cache_resource
-def pool() -> cf.ThreadPoolExecutor:
-    """所有使用者共用的背景執行緒：同時抓多份資料、預先載入。"""
-    return cf.ThreadPoolExecutor(max_workers=12)
+def task_pool_v2() -> cf.ThreadPoolExecutor:
+    """上層工作（算機率、整理公司資料、預先載入）：會等下層結果，所以不能跟下層共用執行緒。"""
+    return cf.ThreadPoolExecutor(max_workers=16, thread_name_prefix="task")
+
+
+@st.cache_resource
+def fetch_pool_v2() -> cf.ThreadPoolExecutor:
+    """下層工作（實際去抓 K 線、新聞、營收…）：只抓資料、不等別人，所以永遠不會卡死。
+
+    v2.4 以前上下層共用同一組 12 個執行緒：最愛一多，上層工作佔滿執行緒在等下層，
+    下層卻排不到執行緒 → 整個 App 卡住（畫面一直「抓取資料中…」）。
+    """
+    return cf.ThreadPoolExecutor(max_workers=24, thread_name_prefix="fetch")
 
 
 def bg(fn, *args):
-    return pool().submit(fn, *args)
+    """丟出上層工作（主畫面用）。"""
+    return task_pool_v2().submit(fn, *args)
 
 
-def wait(fut, default=None):
+def leaf(fn, *args):
+    """丟出下層抓資料工作（上層工作裡面用）。"""
+    return fetch_pool_v2().submit(fn, *args)
+
+
+TIMEOUT = 90          # 單一資料來源最多等幾秒，超過就顯示錯誤，不再無限轉圈
+
+
+def wait(fut, default=None, timeout: float = TIMEOUT):
     try:
-        return fut.result()
+        return fut.result(timeout=timeout)
+    except cf.TimeoutError:
+        if default is not None:
+            return default
+        raise TimeoutError(f"資料來源超過 {timeout} 秒沒有回應，請稍後按「清除快取並重新抓取」再試。")
     except Exception as e:     # 交給呼叫的地方顯示錯誤
         if default is not None:
             return default
@@ -84,6 +107,10 @@ st.markdown("""
 .live .row{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline}
 .live .px{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums}
 [data-testid="InputInstructions"]{display:none!important}
+/* 畫面乾淨一點：隱藏右上角 Fork／GitHub、執行中的 Stop 小人、頂端彩色線，標題列改透明 */
+[data-testid="stToolbarActions"],[data-testid="stAppDeployButton"],[data-testid="stStatusWidget"],
+[data-testid="stDecoration"]{display:none!important}
+header[data-testid="stHeader"]{background:transparent}
 /* 左上角 LOGO（點了回首頁） */
 .st-key-logo button{justify-content:flex-start;padding:2px 4px;margin:-8px 0 2px;border-radius:10px}
 .st-key-logo button p{font-size:1.32rem;font-weight:800;letter-spacing:.02em}
@@ -270,7 +297,7 @@ def get_registry():
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_company(code: str, market: str, name: str, token: str):
     if market == "TW":
-        f_g, f_reg = bg(get_groups, token or ""), bg(get_registry)
+        f_g, f_reg = leaf(get_groups, token or ""), leaf(get_registry)
         g = wait(f_g, pd.DataFrame(columns=["code", "group"]))
         grp = g.loc[g["code"] == code, "group"]
         return company.tw(code, name, wait(f_reg, {}), token or None, grp.iloc[0] if len(grp) else "")
@@ -291,11 +318,11 @@ def get_us_recap(favs: tuple):
 @st.cache_data(ttl=900, show_spinner=False)
 def get_prob(code: str, days: int, token: str | None):
     market = engine.detect_market(code)
-    f_an = bg(analyze, code, days, token)
-    f_news = bg(get_news, code, market, news_name(code))
-    f_rev = bg(get_rev, code, token or "") if market == "TW" else None
-    f_ov = bg(get_ov)
-    _, _, r = f_an.result()
+    f_an = leaf(analyze, code, days, token)
+    f_news = leaf(get_news, code, market, news_name(code))
+    f_rev = leaf(get_rev, code, token or "") if market == "TW" else None
+    f_ov = leaf(get_ov)
+    _, _, r = wait(f_an)
     items = wait(f_news, [])
     rev = wait(f_rev, pd.DataFrame()) if f_rev else None
     return prob.estimate(r, code, items, rev, wait(f_ov, {"ok": False, "nq": 0.0}))
@@ -778,7 +805,7 @@ if st.session_state.nav == HOME:
                    "現價": None, "漲跌": "—", "明日漲機率": None, "10日漲機率": None, "10日區間": "", "停損參考": None, "成本": "", "持倉損益": "", "狀態": ""}
             try:
                 try:
-                    Pc = f_prob[c].result()
+                    Pc = f_prob[c].result(timeout=TIMEOUT)
                 except engine.DataError:
                     raise
                 except Exception:
@@ -1196,13 +1223,13 @@ IDX_REF = {"TW": "^TWII", "US": "^GSPC"}.get(_mk)
 F_IDXQ = bg(get_quotes, (IDX_REF,)) if IDX_REF else None
 try:
     with st.spinner(f"抓取 {code} 資料中…"):
-        market, name, r = F_AN.result()
-except engine.DataError as e:
+        market, name, r = wait(F_AN)
+except (engine.DataError, TimeoutError) as e:
     st.error(str(e))
     st.stop()
 
 try:
-    P = F_PROB.result()
+    P = F_PROB.result(timeout=TIMEOUT)
 except Exception as e:
     P = None
     st.warning(f"機率計算失敗：{e}")
@@ -1610,7 +1637,7 @@ def company_panel():
         return
     try:
         with st.spinner("抓取公司資料中…"):
-            ci = F_CO.result() if F_CO else get_company(code, market, news_name(code), token or "")
+            ci = F_CO.result(timeout=TIMEOUT) if F_CO else get_company(code, market, news_name(code), token or "")
     except Exception as e:
         st.caption(f"公司資料暫時取不到：{e}")
         return

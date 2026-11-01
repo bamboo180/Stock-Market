@@ -123,6 +123,9 @@ requirements.txt  需要的套件
 3. Advanced settings → Secrets，貼上：
      FINMIND_TOKEN = "你的token"
 4. Deploy，完成後會得到 https://xxxx.streamlit.app 網址，手機也能開
+   想要好記的網址：App 右下角 Manage app → ⋮ → Settings → General，可把 xxxx 改成自己取的名字
+   （例如 tsai-stock.streamlit.app）。Community Cloud 只能用 .streamlit.app 結尾，不能接自己買的網域。
+   更新程式：把改過的檔案上傳到同一個 GitHub repo 會自動更新；如果畫面卡住，Manage app → Reboot app
 5. App settings → Sharing → 選「Only specific people can view this app」，
    再輸入要開放的 email（免費方案只能有 1 個非公開 App）
 
