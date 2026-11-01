@@ -44,7 +44,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.6（2026-11-02）"
+APP_VERSION = "v2.7（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -549,21 +549,79 @@ def open_manage():
     st.session_state.manage_open = True
 
 
+def drag_editor(prefix: str):
+    """拖曳排序（可跨群組）。拖完先暫存，按「確認」才儲存，按「取消」還原。"""
+    if SORTABLE is None:
+        st.caption("拖曳功能需要 streamlit-sortables 套件（啟動.bat 會自動安裝），目前請到首頁「管理清單」用按鈕調整。")
+        return False
+    groups = st.session_state.groups
+    pend_key, reset_key = f"{prefix}_pending", f"{prefix}_reset"
+    items = [{"header": f"📁 {g['name']}", "items": [f"{c}　{quick_name(c)}".strip() for c in g["codes"]]}
+             for g in groups]
+    sig = hashlib.md5(json.dumps(groups, ensure_ascii=False).encode()).hexdigest()[:8]
+    res = SORTABLE(items, multi_containers=True, direction="vertical", custom_style=SORT_CSS,
+                   key=f"sort_{prefix}_{sig}_{st.session_state.get(reset_key, 0)}")
+    by_header = {f"📁 {g['name']}": g["name"] for g in groups}
+    if res and res != items:
+        st.session_state[pend_key] = [{"name": by_header.get(x["header"], x["header"].replace("📁 ", "")),
+                                       "codes": [str(it).split("　")[0].strip() for it in x["items"]]} for x in res]
+    elif res == items:
+        st.session_state.pop(pend_key, None)
+    pending = st.session_state.get(pend_key)
+    if pending:
+        st.info("已調整順序，按「確認」才會儲存。")
+    c1, c2 = st.columns(2)
+    if c1.button("✅ 確認", key=f"{prefix}_ok", type="primary", width="stretch", disabled=not pending):
+        st.session_state.groups = st.session_state.pop(pend_key)
+        save_favs()
+        st.session_state[reset_key] = st.session_state.get(reset_key, 0) + 1
+        st.toast("已儲存新的順序")
+        return True
+    if c2.button("↩ 取消", key=f"{prefix}_cancel", width="stretch"):
+        st.session_state.pop(pend_key, None)
+        st.session_state[reset_key] = st.session_state.get(reset_key, 0) + 1   # 重新載入元件 → 回到原本順序
+        return True
+    return False
+
+
 def side_fav_list():
-    """左側欄的最愛：上方下拉選群組，下面一檔一列（代號、名稱、現價、漲跌），整列都可以點。"""
+    """左側欄的最愛：標題位置是群組下拉選單，下面一檔一列（代號、名稱、現價、漲跌），整列都可以點。"""
     names = group_names()
-    if len(names) > 1:
-        opts = ["全部"] + names
-        if st.session_state.get("side_group") not in opts:
-            cur = group_of(st.session_state.code)            # 預設打開目前這檔股票所在的群組
-            st.session_state.side_group = cur if cur in opts else names[0]
-        cnt = {"全部": len(st.session_state.favs), **{g["name"]: len(g["codes"]) for g in st.session_state.groups}}
-        st.selectbox("群組", opts, key="side_group", label_visibility="collapsed",
-                     format_func=lambda x: f"📁 {x}（{cnt.get(x, 0)}）")
-        sel = st.session_state.side_group
-        codes = list(st.session_state.favs) if sel == "全部" else list(_grp(sel)["codes"])
-    else:
-        codes = list(st.session_state.favs)
+    NEW = "＋ 新增群組"
+    opts = ((["全部"] + names) if len(names) > 1 else names) + [NEW]
+    if st.session_state.get("side_group") not in opts:
+        cur = group_of(st.session_state.code)            # 預設打開目前這檔股票所在的群組
+        st.session_state.side_group = cur if cur in opts else opts[0]
+    cnt = {"全部": len(st.session_state.favs), **{g["name"]: len(g["codes"]) for g in st.session_state.groups}}
+    st.selectbox("⭐ 我的最愛", opts, key="side_group",
+                 format_func=lambda x: x if x == NEW else f"📁 {x}（{cnt.get(x, 0)}）",
+                 help="選擇要看的群組；選最下面的「＋ 新增群組」可以建立新群組（例如：群組一、群組二）。")
+    if st.session_state.side_group == NEW:
+        st.text_input("新群組名稱", key="side_new_group", placeholder="例如：群組一、半導體、存股")
+
+        def _create():
+            name = (st.session_state.get("side_new_group") or "").strip()
+            st.session_state.side_new_group = ""
+            if not name:
+                return
+            if name in group_names():
+                st.session_state.store_err = f"已經有「{name}」這個群組了。"
+                return
+            st.session_state.groups.append({"name": name, "codes": []})
+            save_favs()
+            st.session_state.pop("manage_open", None)
+            st.session_state.side_group = name
+            st.toast(f"已建立群組「{name}」，可以用「排序／移動」把股票拖進來")
+        st.button("建立", key="side_new_ok", type="primary", width="stretch", on_click=_create)
+        return
+    if st.session_state.get("side_edit"):
+        st.caption("按住拖曳調整順序，也可以拖到別的群組；按「確認」才會儲存。")
+        if drag_editor("side"):
+            st.session_state.side_edit = False
+            st.rerun()
+        return
+    sel = st.session_state.side_group
+    codes = list(st.session_state.favs) if sel == "全部" else list(_grp(sel)["codes"])
     if not codes:
         st.caption("這個群組還沒有股票。")
         return
@@ -705,13 +763,17 @@ with st.sidebar:
                       "也可以打 18個月、4年、12週、2024-01-01（從這天到今天）。"
                       "這裡決定 K 線與「期間表現」看多久；機率與評分固定用至少 2 年資料計算，不受影響。")
 
-    st.markdown("<div style='font-weight:700;margin-bottom:-6px'>⭐ 我的最愛</div>", unsafe_allow_html=True)
     if st.session_state.favs:
         side_fav_list()
     else:
+        st.markdown("**⭐ 我的最愛**")
         st.caption("還沒有收藏。到個股頁按「☆ 加入最愛」。")
+    if st.session_state.favs and not st.session_state.get("side_edit") and SORTABLE is not None:
+        st.button("排序／移動", key="side_edit_btn", icon=":material/swap_vert:", type="tertiary",
+                  on_click=lambda: st.session_state.update(side_edit=True),
+                  help="拖曳調整順序或移到別的群組，按確認才儲存")
     st.button("管理清單／群組", key="side_manage", icon=":material/tune:", type="tertiary", on_click=open_manage,
-              help="到首頁的「管理清單」新增、刪除、拖曳排序、建立群組")
+              help="到首頁的「管理清單」新增、刪除、建立群組、改名")
 
     st.divider()
     token = SAVED_TOKEN          # FinMind token 從 .streamlit/secrets.toml 讀取
@@ -956,18 +1018,8 @@ if st.session_state.nav == HOME:
         b2.button("＋ 建立群組", on_click=group_add, width="stretch")
         btn_mode = SORTABLE is None or st.toggle("改用按鈕調整順序（手機上拖曳不方便時用）", key="btn_mode")
         if not btn_mode:
-            st.markdown("**拖曳排序**：按住股票拖到想要的位置，也可以直接拖到別的群組，放開就會儲存。")
-            _items = [{"header": f"📁 {g['name']}", "items": [f"{c}　{quick_name(c)}".strip() for c in g["codes"]]}
-                      for g in st.session_state.groups]
-            _sig = hashlib.md5(json.dumps(st.session_state.groups, ensure_ascii=False).encode()).hexdigest()[:10]
-            _res = SORTABLE(_items, multi_containers=True, direction="vertical", custom_style=SORT_CSS,
-                            key=f"sort_{_sig}")
-            if _res and _res != _items:
-                by_header = {f"📁 {g['name']}": g["name"] for g in st.session_state.groups}
-                st.session_state.groups = [{"name": by_header.get(x["header"], x["header"].replace("📁 ", "")),
-                                            "codes": [str(it).split("　")[0].strip() for it in x["items"]]}
-                                           for x in _res]
-                save_favs()
+            st.markdown("**拖曳排序**：按住股票拖到想要的位置，也可以直接拖到別的群組，調整完按「確認」才會儲存。")
+            if drag_editor("home"):
                 st.rerun()
             st.markdown("**群組設定**（名稱改完按 Enter）")
             for gi, g in enumerate(st.session_state.groups):
