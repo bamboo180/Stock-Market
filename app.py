@@ -44,7 +44,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.5（2026-11-01）"
+APP_VERSION = "v2.6（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -107,6 +107,24 @@ st.markdown("""
 .live .row{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline}
 .live .px{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums}
 [data-testid="InputInstructions"]{display:none!important}
+/* 左側欄最愛：條列式，每列蓋一顆透明按鈕，整列都可以點 */
+[class*="st-key-srow_"]{position:relative;gap:0}
+[class*="st-key-srow_"] [class*="st-key-fav_"]{position:absolute!important;inset:0;z-index:2;margin:0;width:100%!important}
+[class*="st-key-srow_"] [class*="st-key-fav_"] *{width:100%!important;height:100%!important}
+[class*="st-key-srow_"] [class*="st-key-fav_"] button{opacity:0;cursor:pointer;min-height:0}
+[class*="st-key-srow_"] [data-testid="stMarkdownContainer"] p{margin:0}
+.st-key-srows{gap:0!important}
+[class*="st-key-srow_"] [data-testid="stMarkdownContainer"]{margin-bottom:0!important}
+.srow{display:flex;justify-content:space-between;align-items:center;padding:9px 10px;
+      border-bottom:1px solid rgba(128,128,128,.22);border-radius:6px}
+[class*="st-key-srow_"]:hover .srow{background:rgba(128,128,128,.12)}
+.srow.on{background:rgba(47,91,211,.13);box-shadow:inset 3px 0 0 #2f5bd3}
+.srow-code{font-weight:700;font-size:.95rem;line-height:1.25}
+.srow-name{font-size:.8rem;color:gray;line-height:1.25;max-width:9.5em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow-r{text-align:right;font-variant-numeric:tabular-nums}
+.srow-px{font-weight:700;font-size:.95rem;line-height:1.25}
+.srow-ch{font-size:.8rem;line-height:1.25}
+.srow-lim{color:#fff;border-radius:4px;padding:0 4px;margin-right:4px;font-size:.72rem}
 /* 畫面乾淨一點：隱藏右上角 Fork／GitHub、執行中的 Stop 小人、頂端彩色線，標題列改透明 */
 [data-testid="stToolbarActions"],[data-testid="stAppDeployButton"],[data-testid="stStatusWidget"],
 [data-testid="stDecoration"]{display:none!important}
@@ -526,6 +544,60 @@ def go_home():
     st.session_state.nav = HOME
 
 
+def open_manage():
+    st.session_state.nav = HOME
+    st.session_state.manage_open = True
+
+
+def side_fav_list():
+    """左側欄的最愛：上方下拉選群組，下面一檔一列（代號、名稱、現價、漲跌），整列都可以點。"""
+    names = group_names()
+    if len(names) > 1:
+        opts = ["全部"] + names
+        if st.session_state.get("side_group") not in opts:
+            cur = group_of(st.session_state.code)            # 預設打開目前這檔股票所在的群組
+            st.session_state.side_group = cur if cur in opts else names[0]
+        cnt = {"全部": len(st.session_state.favs), **{g["name"]: len(g["codes"]) for g in st.session_state.groups}}
+        st.selectbox("群組", opts, key="side_group", label_visibility="collapsed",
+                     format_func=lambda x: f"📁 {x}（{cnt.get(x, 0)}）")
+        sel = st.session_state.side_group
+        codes = list(st.session_state.favs) if sel == "全部" else list(_grp(sel)["codes"])
+    else:
+        codes = list(st.session_state.favs)
+    if not codes:
+        st.caption("這個群組還沒有股票。")
+        return
+    try:                                                     # 報價最多等 2 秒，等不到先顯示名稱
+        q = bg(get_quotes, tuple(codes)).result(timeout=2)
+    except Exception:
+        q = {}
+    active = st.session_state.code if st.session_state.nav == STOCK else None
+    box = st.container(key="srows")
+    for c in codes:
+        mk = market_of(c)
+        up, down = colors(mk, c)
+        nm = quick_name(c)
+        nm = "" if not isinstance(nm, str) or nm.lower() == "nan" else nm
+        qq = q.get(c) or {}
+        px, prev, ch = qq.get("price"), qq.get("prev"), qq.get("chg")
+        if px:
+            col = up if (ch or 0) > 0 else down if (ch or 0) < 0 else "gray"
+            arrow = "▲" if (ch or 0) > 0 else "▼" if (ch or 0) < 0 else ""
+            lim = live.limit_state(px, prev, mk, qq) if prev else None
+            px_s = f"{px:,.0f}" if px >= 10000 else f"{px:,.2f}"
+            badge = (f"<span class='srow-lim' style='background:{'#d1352b' if lim == 'up' else '#14825a'}'>"
+                     f"{'漲停' if lim == 'up' else '跌停'}</span>") if lim else ""
+            right = (f"<div class='srow-px' style='color:{col}'>{px_s}</div>"
+                     f"<div class='srow-ch' style='color:{col}'>{badge}{arrow}{(ch or 0) * 100:+.2f}%</div>")
+        else:
+            right = "<div class='srow-px' style='color:gray'>—</div>"
+        with box.container(key=f"srow_{c}"):
+            st.markdown(f"<div class='srow{' on' if c == active else ''}'>"
+                        f"<div class='srow-l'><div class='srow-code'>{c}</div><div class='srow-name'>{nm}</div></div>"
+                        f"<div class='srow-r'>{right}</div></div>", unsafe_allow_html=True)
+            st.button(f"{c} {nm}", key=f"fav_{c}", on_click=open_stock, args=(c,))
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def search_options(token: str):
     return symbols.build_options(symbols.load_tw(token or None), symbols.load_us())
@@ -633,20 +705,13 @@ with st.sidebar:
                       "也可以打 18個月、4年、12週、2024-01-01（從這天到今天）。"
                       "這裡決定 K 線與「期間表現」看多久；機率與評分固定用至少 2 年資料計算，不受影響。")
 
-    st.caption("⭐ 我的最愛")
+    st.markdown("<div style='font-weight:700;margin-bottom:-6px'>⭐ 我的最愛</div>", unsafe_allow_html=True)
     if st.session_state.favs:
-        _multi = len(st.session_state.groups) > 1
-        for g in st.session_state.groups:
-            if not g["codes"]:
-                continue
-            if _multi:
-                st.markdown(f"<div class='small' style='margin:10px 0 4px'>📁 {g['name']}</div>", unsafe_allow_html=True)
-            cols = st.columns(2)
-            for i, f in enumerate(g["codes"]):
-                cols[i % 2].button(f, key=f"fav_{f}", width="stretch", on_click=open_stock, args=(f,),
-                                   type="primary" if f == st.session_state.code and st.session_state.nav == STOCK else "secondary")
+        side_fav_list()
     else:
         st.caption("還沒有收藏。到個股頁按「☆ 加入最愛」。")
+    st.button("管理清單／群組", key="side_manage", icon=":material/tune:", type="tertiary", on_click=open_manage,
+              help="到首頁的「管理清單」新增、刪除、拖曳排序、建立群組")
 
     st.divider()
     token = SAVED_TOKEN          # FinMind token 從 .streamlit/secrets.toml 讀取
