@@ -35,7 +35,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.9（2026-11-02）"
+APP_VERSION = "v2.9.1（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -114,7 +114,7 @@ st.markdown("""
 .srow-name{font-size:.8rem;color:gray;line-height:1.25;max-width:9.5em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .srow-r{text-align:right;font-variant-numeric:tabular-nums}
 .srow-px{font-weight:700;font-size:.95rem;line-height:1.25}
-.srow-ch{font-size:.8rem;line-height:1.25}
+.srow-ch{font-size:.8rem;line-height:1.25;white-space:nowrap}
 .srow-lim{color:#fff;border-radius:4px;padding:0 4px;margin-right:4px;font-size:.72rem}
 /* 畫面乾淨一點：隱藏右上角 Fork／GitHub、執行中的 Stop 小人、頂端彩色線，標題列改透明 */
 [data-testid="stToolbarActions"],[data-testid="stAppDeployButton"],[data-testid="stStatusWidget"],
@@ -665,8 +665,10 @@ def side_fav_list():
             px_s = f"{px:,.0f}" if px >= 10000 else f"{px:,.2f}"
             badge = (f"<span class='srow-lim' style='background:{'#d1352b' if lim == 'up' else '#14825a'}'>"
                      f"{'漲停' if lim == 'up' else '跌停'}</span>") if lim else ""
+            diff = (px - prev) if prev else None             # 漲跌多少元
+            diff_s = "" if diff is None else (f"{diff:+,.0f}" if abs(diff) >= 1000 else f"{diff:+,.2f}") + "　"
             right = (f"<div class='srow-px' style='color:{col}'>{px_s}</div>"
-                     f"<div class='srow-ch' style='color:{col}'>{badge}{arrow}{(ch or 0) * 100:+.2f}%</div>")
+                     f"<div class='srow-ch' style='color:{col}'>{badge}{arrow}{diff_s}{(ch or 0) * 100:+.2f}%</div>")
         else:
             right = "<div class='srow-px' style='color:gray'>—</div>"
         with box.container(key=f"srow_{c}"):
