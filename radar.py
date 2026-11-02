@@ -192,6 +192,11 @@ def score(info: dict, px: pd.DataFrame, q: pd.DataFrame) -> dict:
             c = 0
             tags.append("已大漲")
             why.append(f"近 3 個月已漲 {r60 * 100:.0f}%")
+        elif r60 <= -0.2:
+            # 風青起漲前是「跌不下去、慢慢打底」，不是「正在大跌」：急跌中的股票低檔分數打折
+            c = round(c * (0.3 if r60 <= -0.3 else 0.6))
+            tags.append("仍在急跌")
+            why.append(f"近 3 個月跌了 {abs(r60) * 100:.0f}%，還沒止跌")
     else:
         why.append("股價資料不足一年")
     c = min(c, 25)
@@ -217,10 +222,20 @@ def score(info: dict, px: pd.DataFrame, q: pd.DataFrame) -> dict:
             why.append("量能平穩、股價守得住")
     dd = min(dd, 25)
 
+    # ---- 標記：大型股、可能一次性收入 ----
+    rev_k = info.get("rev", np.nan)                       # 單位：千元
+    if pd.notna(rev_k) and rev_k >= 1_000_000:            # 月營收 10 億以上
+        tags.append("大型股")
+    one_off = ("處分", "出售", "土地", "建案", "交屋", "一次性", "認列", "權利金", "業外")
+    note = str(info.get("note", "") or "")
+    if (yoy >= 150 and any(k in note for k in one_off)) or (yoy >= 300 and pd.notna(cum) and cum < 20):
+        tags.append("可能一次性")
+        why.append("營收暴增可能來自一次性因素，請看公司說明")
     return {"code": info["code"], "name": info["name"], "industry": info["industry"], "market": info["market"],
             "score": int(a + b + c + dd), "s_rev": a, "s_eps": b, "s_low": c, "s_chip": dd,
             "yoy": yoy, "cum_yoy": cum, "eps": eps_last, "eps_ly": eps_ly, "pos": pos, "r60": r60,
-            "margin20": mg_chg, "inst20": inst20, "tags": tags, "why": why, "note": info.get("note", "")}
+            "margin20": mg_chg, "inst20": inst20, "tags": tags, "why": why, "note": info.get("note", ""),
+            "rev": rev_k}
 
 
 def scan(token: str | None, n: int = 40, market: str = "全部", workers: int = 6) -> dict:
