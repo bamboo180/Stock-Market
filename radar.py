@@ -286,11 +286,11 @@ def log_entry(R: dict, market: str, n: int, today: str, top: int = 30) -> dict:
     """把一次掃描濃縮成一筆紀錄（只留分數最高的 top 檔，省空間）。"""
     rows = []
     for x in R.get("rows", [])[:top]:
-        if pd.isna(x.get("close")):
-            continue
+        c = x.get("close")
+        # 沒有當天收盤價（例如舊版留下的結果）也照樣記錄，之後用 Yahoo 掃描日的收盤價補上
+        p = round(float(c), 2) if c is not None and not pd.isna(c) else None
         rows.append({"c": x["code"], "n": x["name"], "m": x["market"], "s": x["score"],
-                     "f": [x["s_rev"], x["s_eps"], x["s_low"], x["s_chip"]], "t": x["tags"],
-                     "p": round(float(x["close"]), 2)})
+                     "f": [x["s_rev"], x["s_eps"], x["s_low"], x["s_chip"]], "t": x.get("tags", []), "p": p})
     return {"date": today, "ym": R.get("ym", ""), "market": market, "n": n, "rows": rows}
 
 

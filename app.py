@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.2.2（2026-11-02）"
+APP_VERSION = "v3.2.3（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -1436,7 +1436,7 @@ def _radar_cols() -> dict:
 
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
-def get_radar(token: str, n: int, market: str, day: str, rules: str = "v3.1"):
+def get_radar(token: str, n: int, market: str, day: str, rules: str = "v3.2.3"):
     return radar.scan(token or None, n, market)
 
 
@@ -1458,7 +1458,7 @@ def radar_scan_tab():
             return
         try:
             with st.spinner(f"掃描中：先篩全市場月營收，再逐檔分析前 {r_n} 名，約 1～2 分鐘…"):
-                R = get_radar(token or "", int(r_n), r_market, f"{dt.date.today():%Y%m%d}", "v3.1")
+                R = get_radar(token or "", int(r_n), r_market, f"{dt.date.today():%Y%m%d}", "v3.2.3")
         except Exception as e:
             st.error(f"掃描失敗：{e}")
             return
@@ -1472,9 +1472,13 @@ def radar_scan_tab():
                 st.session_state.radar_log = _new
                 save_favs()
                 st.session_state.manage_open = _keep
-                st.toast(f"已把今天的 {len(_entry['rows'])} 檔記錄到「歷史成績單」")
+                st.success(f"已把今天分數最高的 {len(_entry['rows'])} 檔記錄到「📈 歷史成績單」。")
+            elif not _entry["rows"]:
+                st.warning("這次掃描沒有可記錄的股票，所以沒有存進歷史成績單。")
+            else:
+                st.caption(f"今天（{_entry['date']}）已經記錄過了，歷史成績單一天只記第一次掃描。")
         except Exception as _e:
-            st.caption(f"（這次沒有記錄到歷史成績單：{_e}）")
+            st.warning(f"這次沒有記錄到歷史成績單：{_e}")
         rows = [x for x in R["rows"] if x["score"] >= r_min and (r_hot or "已大漲" not in x["tags"])
                 and (not r_small or "大型股" not in x.get("tags", []))]
         st.caption(f"營收資料：{radar.ym_text(R['ym'])}｜全市場 {R['n_all']} 家 → 營收加速候選 {R['n_cand']} 家 → "
@@ -1553,7 +1557,7 @@ def radar_history():
         st.success(f"已記錄 {len(log)} 次掃描、共 {n_rows} 檔（最近一次：{log[-1]['date']}）。"
                    "要等掃描日之後至少 1 個交易日收盤，才開始計算漲跌與跟大盤比較。")
         last = log[-1]
-        st.dataframe(pd.DataFrame([{"代號": r["c"], "名稱": r["n"], "分數": r["s"], "記錄價格": r["p"],
+        st.dataframe(pd.DataFrame([{"代號": r["c"], "名稱": r["n"], "分數": r["s"], "記錄價格": f"{r['p']:,.2f}" if r.get("p") else "之後補上",
                                     "標記": "、".join(r.get("t", []))} for r in last["rows"]]),
                      hide_index=True, width="stretch")
         return
