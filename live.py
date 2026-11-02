@@ -137,7 +137,35 @@ def quotes(codes: list[str], market_of) -> dict[str, dict]:
         q = quote_us(c)
         if q:
             out[c] = q
+    # 證交所查不到的台股（興櫃股票，或剛掛牌的新股）→ 改查 Yahoo（上櫃／興櫃用 .TWO，上市用 .TW）
+    for c in [c for c in tw if c not in out]:
+        for suffix in (".TWO", ".TW"):
+            q = quote_us(c + suffix)
+            if q:
+                tnow = now("TW")
+                q.update({"date": tnow.strftime("%Y%m%d"), "time": tnow.strftime("%H:%M:%S"),
+                          "source": "Yahoo（證交所無報價，可能是興櫃）", "name": tw_name_yahoo(c + suffix)})
+                out[c] = q
+                break
     return out
+
+
+_NAME_CACHE: dict[str, str] = {}
+
+
+def tw_name_yahoo(ticker: str) -> str:
+    """Yahoo 上的公司名稱（內建清單沒有的股票才用，例如興櫃）。查過就記住，不重複查。"""
+    if ticker in _NAME_CACHE:
+        return _NAME_CACHE[ticker]
+    name = ""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+        name = info.get("longName") or info.get("shortName") or ""
+    except Exception:
+        pass
+    _NAME_CACHE[ticker] = name
+    return name
 
 
 def limit_state(price: float | None, prev: float | None, market: str, q: dict | None = None) -> str:

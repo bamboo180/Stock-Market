@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 favorites.json
+radar_history.json

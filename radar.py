@@ -171,7 +171,7 @@ def score(info: dict, px: pd.DataFrame, q: pd.DataFrame) -> dict:
     b = min(b, 25)
 
     # ---- 3. 低檔打底 ----
-    c, pos, r60, r20 = 0, np.nan, np.nan, np.nan
+    c, pos, r60, r20, last = 0, np.nan, np.nan, np.nan, np.nan
     d = px.tail(250).reset_index(drop=True) if px is not None else pd.DataFrame()
     if len(d) >= 120:
         cl = d["close"].astype(float)
@@ -235,7 +235,8 @@ def score(info: dict, px: pd.DataFrame, q: pd.DataFrame) -> dict:
             "score": int(a + b + c + dd), "s_rev": a, "s_eps": b, "s_low": c, "s_chip": dd,
             "yoy": yoy, "cum_yoy": cum, "eps": eps_last, "eps_ly": eps_ly, "pos": pos, "r60": r60,
             "margin20": mg_chg, "inst20": inst20, "tags": tags, "why": why, "note": info.get("note", ""),
-            "rev": rev_k}
+            "rev": rev_k, "close": float(d["close"].iloc[-1]) if len(d) else np.nan,
+            "px_date": str(pd.Timestamp(d["date"].iloc[-1]).date()) if len(d) else ""}
 
 
 def scan(token: str | None, n: int = 40, market: str = "全部", workers: int = 6) -> dict:
@@ -276,3 +277,222 @@ def ym_text(ym: str) -> str:
     if re.fullmatch(r"\d{5}", ym or ""):
         return f"{int(ym[:3]) + 1911} 年 {int(ym[3:])} 月"
     return ym or "—"
+
+
+# ============================================================================
+# 歷史成績單：每次掃描存檔，之後回頭對答案
+# ============================================================================
+HIST_FILE = "radar_history.json"
+MAX_SCANS = 150
+HORIZONS = {"1 個月": 20, "3 個月": 60, "6 個月": 120}       # 交易日
+FACTORS = {"s_rev": "營收動能", "s_eps": "獲利轉機", "s_low": "低檔打底", "s_chip": "籌碼乾淨", "score": "總分"}
+
+
+def norm_history(data) -> dict:
+    scans = (data or {}).get("scans") if isinstance(data, dict) else None
+    scans = [x for x in (scans or []) if isinstance(x, dict) and x.get("date") and x.get("rows")]
+    scans.sort(key=lambda x: (x["date"], x.get("market", "")))
+    return {"scans": scans[-MAX_SCANS:]}
+
+
+def _clean_num(v):
+    return None if v is None or (isinstance(v, float) and not np.isfinite(v)) else v
+
+
+def add_scan(hist: dict, R: dict, market: str, rules: str, date: str | None = None) -> dict:
+    """把這次掃描的全部候選（不只顯示出來的）存起來；同一天同市場只留最新一次。"""
+    date = date or str(dt.date.today())
+    rows = [{"code": r["code"], "name": r["name"], "market": r["market"], "score": r["score"],
+             "s_rev": r["s_rev"], "s_eps": r["s_eps"], "s_low": r["s_low"], "s_chip": r["s_chip"],
+             "tags": r["tags"], "close": _clean_num(r.get("close")), "px_date": r.get("px_date", "")}
+            for r in R.get("rows", []) if _clean_num(r.get("close"))]
+    if not rows:
+        return hist
+    scans = [x for x in hist.get("scans", []) if not (x["date"] == date and x.get("market") == market)]
+    scans.append({"date": date, "market": market, "rules": rules, "ym": R.get("ym", ""), "rows": rows})
+    return norm_history({"scans": scans})
+
+
+def _yf_closes(tickers: list[str], start: str) -> pd.DataFrame:
+    import yfinance as yf
+    raw = yf.download(tickers, start=start, auto_adjust=True, progress=False, threads=True, group_by="column")
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    c = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]].rename(columns={"Close": tickers[0]})
+    c.index = pd.to_datetime(c.index).tz_localize(None)
+    return c
+
+
+def evaluate(hist: dict, closes_fn=_yf_closes) -> dict:
+    """計算每次入選的股票後來的表現（相對加權指數）。"""
+    scans = hist.get("scans", [])
+    if not scans:
+        return {"picks": pd.DataFrame(), "scans": pd.DataFrame(), "factors": pd.DataFrame(), "tags": pd.DataFrame()}
+    recs = []
+    for sc in scans:
+        for r in sc["rows"]:
+            recs.append({**r, "scan_date": sc["date"], "scan_market": sc.get("market", ""),
+                         "ticker": r["code"] + (".TWO" if r.get("market") == "上櫃" else ".TW")})
+    picks = pd.DataFrame(recs)
+    start = (pd.Timestamp(min(picks["scan_date"])) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    tickers = sorted(set(picks["ticker"])) + ["^TWII"]
+    try:
+        closes = closes_fn(tickers, start)
+    except Exception:
+        closes = pd.DataFrame()
+    out = []
+    for _, p in picks.iterrows():
+        row = p.to_dict()
+        s = closes[p["ticker"]].dropna() if p["ticker"] in closes else pd.Series(dtype=float)
+        b = closes["^TWII"].dropna() if "^TWII" in closes else pd.Series(dtype=float)
+        t0 = pd.Timestamp(p["scan_date"])
+        s_after, b_after = s[s.index > t0], b[b.index > t0]
+        b0 = b[b.index <= t0]
+        row["days"] = len(s_after)
+        if len(s) and p.get("close"):
+            row["ret_now"] = float(s.iloc[-1] / p["close"] - 1) if len(s_after) else np.nan
+            row["bench_now"] = float(b.iloc[-1] / b0.iloc[-1] - 1) if len(b0) and len(b_after) else np.nan
+            row["ex_now"] = row["ret_now"] - row["bench_now"] if pd.notna(row.get("bench_now")) else np.nan
+            for name, n in HORIZONS.items():
+                if len(s_after) >= n and len(b_after) >= n and len(b0):
+                    r_ = float(s_after.iloc[n - 1] / p["close"] - 1)
+                    br = float(b_after.iloc[n - 1] / b0.iloc[-1] - 1)
+                    row[f"ret_{n}"], row[f"ex_{n}"] = r_, r_ - br
+        out.append(row)
+    picks = pd.DataFrame(out)
+    for col in ["ret_now", "bench_now", "ex_now"] + [f"{k}_{n}" for n in HORIZONS.values() for k in ("ret", "ex")]:
+        if col not in picks:
+            picks[col] = np.nan
+
+    # 每次掃描的成績
+    srows = []
+    for (d, mk), x in picks.groupby(["scan_date", "scan_market"]):
+        ex = x["ex_now"]
+        srows.append({"scan_date": d, "scan_market": mk, "入選檔數": len(x), "平均報酬": x["ret_now"].mean(),
+                      "大盤": x["bench_now"].mean(), "平均超額": ex.mean(),
+                      "贏大盤比例": (ex > 0).mean() if ex.notna().any() else np.nan,
+                      "前10名平均超額": x.nlargest(10, "score")["ex_now"].mean(), "已過交易日": x["days"].max()})
+    scans_df = pd.DataFrame(srows).sort_values("scan_date", ascending=False) if srows else pd.DataFrame()
+
+    # 哪個條件有用：每個面向「分數高的一半」減「分數低的一半」的平均超額報酬（至少持有 20 個交易日的樣本）
+    m = picks[(picks["days"] >= 20) & picks["ex_now"].notna()]
+    fac = []
+    if len(m) >= 20:
+        for k, name in FACTORS.items():
+            med = m[k].median()
+            hi, lo = m[m[k] > med]["ex_now"], m[m[k] <= med]["ex_now"]
+            if len(hi) >= 5 and len(lo) >= 5:
+                fac.append({"條件": name, "高分組平均超額": hi.mean(), "低分組平均超額": lo.mean(),
+                            "差距": hi.mean() - lo.mean(), "樣本": len(m)})
+    tags = []
+    if len(m) >= 20:
+        for t in ("已大漲", "仍在急跌", "大型股", "可能一次性"):
+            has = m[m["tags"].apply(lambda x: t in (x or []))]["ex_now"]
+            if len(has) >= 3:
+                tags.append({"標記": t, "有標記平均超額": has.mean(),
+                             "沒標記平均超額": m[~m["tags"].apply(lambda x: t in (x or []))]["ex_now"].mean(), "檔數": len(has)})
+    return {"picks": picks, "scans": scans_df, "factors": pd.DataFrame(fac), "tags": pd.DataFrame(tags), "n_eval": len(m)}
+
+
+# ----------------------------------------------------------------------------
+# 歷史成績單：記錄每次掃描，事後對答案
+# ----------------------------------------------------------------------------
+def log_entry(R: dict, market: str, n: int, today: str, top: int = 30) -> dict:
+    """把一次掃描濃縮成一筆紀錄（只留分數最高的 top 檔，省空間）。"""
+    rows = []
+    for x in R.get("rows", [])[:top]:
+        if pd.isna(x.get("close")):
+            continue
+        rows.append({"c": x["code"], "n": x["name"], "m": x["market"], "s": x["score"],
+                     "f": [x["s_rev"], x["s_eps"], x["s_low"], x["s_chip"]], "t": x["tags"],
+                     "p": round(float(x["close"]), 2)})
+    return {"date": today, "ym": R.get("ym", ""), "market": market, "n": n, "rows": rows}
+
+
+def add_log(log: list, entry: dict, max_len: int = 120) -> tuple[list, bool]:
+    """同一天只記一次（第一次掃描）。回傳 (新紀錄, 有沒有新增)。"""
+    if not entry["rows"] or any(e.get("date") == entry["date"] for e in log):
+        return log, False
+    return (list(log) + [entry])[-max_len:], True
+
+
+def _yahoo_closes(tickers: list[str], start: str) -> pd.DataFrame:
+    import yfinance as yf
+    raw = yf.download(tickers, start=start, auto_adjust=True, progress=False, threads=True, group_by="ticker")
+    out = {}
+    for t in tickers:
+        try:
+            c = (raw[t]["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]).dropna()
+        except Exception:
+            continue
+        if len(c):
+            c.index = pd.to_datetime(c.index).tz_localize(None)
+            out[t] = c
+    return pd.DataFrame(out)
+
+
+BENCH = "^TWII"
+HORIZONS = {"20": 20, "60": 60}          # 交易日：約 1 個月、3 個月
+FACTORS = ["營收動能", "獲利轉機", "低檔打底", "籌碼乾淨"]
+
+
+def evaluate(log: list, closes: pd.DataFrame | None = None) -> pd.DataFrame:
+    """每一筆入選紀錄算：到今天的報酬、20／60 個交易日後的報酬，以及同期間贏大盤多少。"""
+    if not log:
+        return pd.DataFrame()
+    tick = lambda r: r["c"] + (".TW" if r.get("m") == "上市" else ".TWO")
+    if closes is None:
+        tickers = sorted({tick(r) for e in log for r in e["rows"]} | {BENCH})
+        start = (pd.Timestamp(min(e["date"] for e in log)) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+        closes = _yahoo_closes(tickers, start)
+    if closes is None or closes.empty or BENCH not in closes:
+        return pd.DataFrame()
+    bench = closes[BENCH].dropna()
+    out = []
+    for e in log:
+        d0 = pd.Timestamp(e["date"])
+        b_after = bench[bench.index >= d0]
+        b_before = bench[bench.index <= d0]
+        if not len(b_before):
+            continue
+        b0 = float(b_before.iloc[-1])
+        for r in e["rows"]:
+            t = tick(r)
+            if t not in closes:
+                continue
+            s = closes[t].dropna()
+            after = s[s.index > d0]
+            p0 = r.get("p") or (float(s[s.index <= d0].iloc[-1]) if (s.index <= d0).any() else np.nan)
+            if not p0 or np.isnan(p0) or not len(s):
+                continue
+            row = {"date": e["date"], "code": r["c"], "name": r["n"], "score": r["s"], "tags": "、".join(r.get("t", [])),
+                   **{FACTORS[i]: r["f"][i] for i in range(4)},
+                   "days": len(after), "ret": float(s.iloc[-1]) / p0 - 1, "bench": float(bench.iloc[-1]) / b0 - 1}
+            for k, h in HORIZONS.items():
+                if len(after) >= h and len(b_after) >= h:
+                    row[f"ret{k}"] = float(after.iloc[h - 1]) / p0 - 1
+                    row[f"bench{k}"] = float(b_after.iloc[h - 1]) / b0 - 1
+                else:
+                    row[f"ret{k}"] = row[f"bench{k}"] = np.nan
+            out.append(row)
+    df = pd.DataFrame(out)
+    if len(df):
+        df["excess"] = df["ret"] - df["bench"]
+        for k in HORIZONS:
+            df[f"excess{k}"] = df[f"ret{k}"] - df[f"bench{k}"]
+    return df
+
+
+def factor_report(df: pd.DataFrame, horizon: str = "20", min_n: int = 5) -> pd.DataFrame:
+    """每個條件「高分組（≥18 分）」比「低分組」多贏大盤幾個百分點。差越大代表這個條件越有用。"""
+    col = f"excess{horizon}"
+    if df.empty or col not in df:
+        return pd.DataFrame()
+    d = df.dropna(subset=[col])
+    rows = []
+    for f in FACTORS:
+        hi, lo = d[d[f] >= 18][col], d[d[f] < 18][col]
+        if len(hi) >= min_n and len(lo) >= min_n:
+            rows.append({"條件": f, "高分組筆數": len(hi), "高分組贏大盤": hi.mean(), "低分組筆數": len(lo),
+                         "低分組贏大盤": lo.mean(), "差距": hi.mean() - lo.mean()})
+    return pd.DataFrame(rows)

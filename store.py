@@ -24,6 +24,7 @@ class StoreError(Exception):
 
 
 DEFAULT_GROUP = "我的最愛"
+RADAR_LOG_MAX = 120          # 潛力股雷達最多保留幾次掃描紀錄（一天最多記一次，約半年）
 
 
 def clean_groups(groups, extra=None) -> list[dict]:
@@ -66,7 +67,10 @@ def _normalize(data) -> dict:
         groups = clean_groups(data["groups"])
     else:
         groups = clean_groups([{"name": DEFAULT_GROUP, "codes": data.get("favorites", DEFAULT)}])
-    return {"favorites": flatten(groups), "groups": groups,
+    log = data.get("radar_log")
+    log = [x for x in log if isinstance(x, dict) and x.get("date") and x.get("rows")][-RADAR_LOG_MAX:] \
+        if isinstance(log, list) else []
+    return {"favorites": flatten(groups), "groups": groups, "radar_log": log,
             "indices": _clean(DEFAULT_INDICES if idx is None else idx),
             "positions": {str(k).upper(): v for k, v in pos.items() if isinstance(v, dict) and v.get("cost")}}
 
@@ -104,8 +108,10 @@ class LocalStore:
 class GitHubStore:
     API = "https://api.github.com"
 
-    def __init__(self, token: str, repo: str, branch: str = "favorites-data", path: str = "favorites.json"):
+    def __init__(self, token: str, repo: str, branch: str = "favorites-data", path: str = "favorites.json",
+                 normalize=None):
         self.repo, self.branch, self.path = repo.strip().strip("/"), branch, path
+        self.norm = normalize or _normalize
         self.h = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                   "X-GitHub-Api-Version": "2022-11-28"}
         self.label = f"GitHub（{self.repo} 的 {branch} 分支）"
@@ -130,7 +136,7 @@ class GitHubStore:
 
     def load(self) -> dict:
         data, _ = self._file()
-        return _normalize(data)
+        return self.norm(data)
 
     def _ensure_branch(self):
         r = self._req("GET", f"/repos/{self.repo}/git/ref/heads/{self.branch}")
@@ -148,8 +154,8 @@ class GitHubStore:
     def save(self, data: dict) -> None:
         self._ensure_branch()
         _, sha = self._file()
-        body = {"message": "update favorites/positions", "branch": self.branch,
-                "content": base64.b64encode(json.dumps(_normalize(data), ensure_ascii=False, indent=1).encode()).decode()}
+        body = {"message": f"update {self.path}", "branch": self.branch,
+                "content": base64.b64encode(json.dumps(self.norm(data), ensure_ascii=False, indent=1).encode()).decode()}
         if sha:
             body["sha"] = sha
         r = self._req("PUT", f"/repos/{self.repo}/contents/{self.path}", json=body)
@@ -161,3 +167,33 @@ def make_store(github_token: str = "", github_repo: str = ""):
     if github_token and github_repo:
         return GitHubStore(github_token, github_repo)
     return LocalStore()
+
+
+# ----------------------------------------------------------------------------
+# 其他資料（例如潛力股雷達的歷史紀錄）：跟最愛一樣，有 GitHub 設定就存 GitHub，否則存本機
+# ----------------------------------------------------------------------------
+class LocalJsonStore:
+    def __init__(self, filename: str, normalize):
+        self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        self.norm = normalize
+        self.label = f"本機檔案 {filename}"
+
+    def load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                return self.norm(json.load(f))
+        except Exception:
+            return self.norm(None)
+
+    def save(self, data) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.norm(data), f, ensure_ascii=False)
+        except OSError as e:
+            raise StoreError(f"無法寫入 {os.path.basename(self.path)}：{e}") from e
+
+
+def make_json_store(filename: str, normalize, github_token: str = "", github_repo: str = ""):
+    if github_token and github_repo:
+        return GitHubStore(github_token, github_repo, path=filename, normalize=normalize)
+    return LocalJsonStore(filename, normalize)
