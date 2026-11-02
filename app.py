@@ -30,12 +30,13 @@ import live
 import news
 import position
 import prob
+import radar
 import recap
 import session
 import store
 import symbols
 
-APP_VERSION = "v2.9.2（2026-11-02）"
+APP_VERSION = "v3.0（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -206,8 +207,8 @@ def on_period_change():
     elif str(st.session_state.get("store_err", "")).startswith(("資料期間", "看不懂")):
         st.session_state.pop("store_err")
 LIVE_EVERY = 60          # 盤中即時報價更新秒數
-VIEWS = ["📈 市場總覽", "📰 盤後整理", "🔍 個股分析"]
-HOME, RECAP, STOCK = VIEWS
+VIEWS = ["📈 市場總覽", "📰 盤後整理", "🔍 個股分析", "🧭 潛力股雷達"]
+HOME, RECAP, STOCK, RADAR = VIEWS
 
 
 def market_of(code: str) -> str:
@@ -779,7 +780,7 @@ def on_table_select():
 # 側邊欄
 # ----------------------------------------------------------------------------
 # 網址記住目前頁面、股票與資料期間：按瀏覽器重新整理（F5）會留在原地，不會跳回首頁
-QP_VIEW = {"home": HOME, "recap": RECAP, "stock": STOCK}
+QP_VIEW = {"home": HOME, "recap": RECAP, "stock": STOCK, "radar": RADAR}
 QP_KEY = {v: k for k, v in QP_VIEW.items()}
 if "nav" not in st.session_state:
     _qp = st.query_params
@@ -1397,6 +1398,99 @@ if st.session_state.nav == RECAP:
 
     st.caption("本工具為個人研究用技術原型，不構成投資建議。")
     st.stop()
+
+# ============================================================================
+# 頁面四：潛力股雷達（獨立頁面，不影響其他功能）
+# ============================================================================
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def get_radar(token: str, n: int, market: str, day: str):
+    return radar.scan(token or None, n, market)
+
+
+if st.session_state.nav == RADAR:
+    st.title("🧭 潛力股雷達")
+    st.caption("用「風青（2061）」2026 年大漲前的訊號，找出目前條件相似、但股價還在低檔的股票。")
+    with st.expander("篩選邏輯：從風青的經驗來", expanded=False):
+        st.markdown(
+            "風青大漲前看得到四個訊號，這裡每個面向各 25 分，總分 100：\n\n"
+            "1. **營收動能**：最新月營收年增 15% 以上，而且比今年累計年增還好（正在加速）。"
+            "風青 2026 年 1 月營收年增 43%。\n"
+            "2. **獲利轉機**：最新一季 EPS 轉虧為盈或大幅成長、毛利率比去年同季回升。"
+            "風青第一季 EPS 由虧轉盈、毛利率 5 年新高。\n"
+            "3. **低檔打底**：股價在一年區間的低檔、季線走平或剛翻揚。近 3 個月已漲超過 50% 的標記為「已大漲」，這一項不給分。\n"
+            "4. **籌碼乾淨**：近 20 日融資沒有增加、外資＋投信有買超、量能平穩股價守得住。\n\n"
+            "排序重點是「加速」：最新月營收年增比今年累計年增好越多越前面（風青就是這種轉機型）。"
+            "金融業與建材營造（交屋才認列營收，單月暴增很常見）不列入。\n\n"
+            "做法：先用證交所／櫃買中心的「每月營收彙總表」一次篩出全市場營收在加速的公司，"
+            "再對這些候選股逐檔抓 FinMind 的股價、法人、融資與季報來評分。")
+    f1, f2, f3, f4 = st.columns([1.1, 1, 1.2, 1.3], vertical_alignment="bottom")
+    r_market = f1.selectbox("市場", ["全部", "上市", "上櫃"], key="radar_market")
+    r_n = f2.selectbox("候選數量", [20, 40, 60], index=1, key="radar_n",
+                       help="第一階段挑出營收加速最明顯的前幾家來細算。越多越完整，但抓資料越久、也越耗 FinMind 額度")
+    r_min = f3.slider("最低分數", 0, 100, 45, 5, key="radar_min")
+    r_hot = f4.checkbox("也顯示「已大漲」的股票", key="radar_hot")
+    run = st.button("🔍 開始掃描", type="primary", key="radar_run_btn")
+    if run:
+        st.session_state.radar_run = True
+    if not st.session_state.get("radar_run"):
+        st.info("按「開始掃描」後約需 1～2 分鐘（要逐檔抓股價、法人與季報）。結果會保留 12 小時，之後再打開會直接顯示。")
+        st.caption("本工具為個人研究用技術原型，不構成投資建議。")
+        st.stop()
+    try:
+        with st.spinner(f"掃描中：先篩全市場月營收，再逐檔分析前 {r_n} 名，約 1～2 分鐘…"):
+            R = get_radar(token or "", int(r_n), r_market, f"{dt.date.today():%Y%m%d}")
+    except Exception as e:
+        st.error(f"掃描失敗：{e}")
+        st.stop()
+    rows = [x for x in R["rows"] if x["score"] >= r_min and (r_hot or "已大漲" not in x["tags"])]
+    st.caption(f"營收資料：{radar.ym_text(R['ym'])}｜全市場 {R['n_all']} 家 → 營收加速候選 {R['n_cand']} 家 → "
+               f"符合條件 {len(rows)} 家｜來源：" + "、".join(f"{k} {v}" for k, v in R["status"].items()))
+    if "上櫃" in R["status"] and not R["status"]["上櫃"].endswith("家"):
+        st.warning("櫃買中心的月營收這次沒抓到，結果只包含上市股票。可以稍後按「清除快取並重新抓取」再試。")
+    if not rows:
+        st.info("目前沒有符合條件的股票，可以把「最低分數」調低一點看看。")
+    else:
+        tbl = pd.DataFrame([{
+            "代號": x["code"], "名稱": x["name"], "分數": x["score"],
+            "營收年增": f"{x['yoy']:+.0f}%", "累計年增": "—" if pd.isna(x["cum_yoy"]) else f"{x['cum_yoy']:+.0f}%",
+            "最近EPS": "—" if pd.isna(x["eps"]) else f"{x['eps']:+.2f}",
+            "去年同季": "—" if pd.isna(x["eps_ly"]) else f"{x['eps_ly']:+.2f}",
+            "一年位置": "—" if pd.isna(x["pos"]) else f"{x['pos'] * 100:.0f}%",
+            "近3個月": "—" if pd.isna(x["r60"]) else f"{x['r60'] * 100:+.0f}%",
+            "營收／獲利／低檔／籌碼": f"{x['s_rev']}／{x['s_eps']}／{x['s_low']}／{x['s_chip']}",
+            "產業": x["industry"], "標記": "、".join(x["tags"]),
+        } for x in rows])
+        codes = [x["code"] for x in rows]
+
+        def on_radar_pick():
+            sel = st.session_state.radar_table.selection.rows
+            if sel:
+                open_stock(codes[sel[0]])
+
+        st.dataframe(tbl, hide_index=True, width="stretch", key="radar_table", on_select=on_radar_pick,
+                     selection_mode="single-row",
+                     column_config={"分數": st.column_config.ProgressColumn("分數", min_value=0, max_value=100, format="%d"),
+                                    "代號": st.column_config.TextColumn(width="small"),
+                                    "名稱": st.column_config.TextColumn(width="small")})
+        st.caption("點任一列左邊的方框，就會開啟那檔股票的完整分析。「一年位置」0% 是一年最低、100% 是一年最高。")
+        st.markdown("#### 前幾名的理由")
+        for x in rows[:8]:
+            with st.container(border=True):
+                h1, h2 = st.columns([5, 1.2], vertical_alignment="center")
+                h1.markdown(f"**{x['code']} {x['name']}**　<span class='small'>{x['industry']}｜{x['market']}</span>　"
+                            f"**{x['score']} 分**" + ("　" + "".join(f"<span class='chip'>{t}</span>" for t in x["tags"]) if x["tags"] else ""),
+                            unsafe_allow_html=True)
+                h2.button("看分析 ›", key=f"radar_open_{x['code']}", on_click=open_stock, args=(x["code"],), width="stretch")
+                st.markdown("、".join(x["why"]) + "。")
+                if x.get("note"):
+                    st.caption(f"公司說明營收變動原因：{x['note'][:80]}")
+    if R.get("errors"):
+        with st.expander(f"有 {len(R['errors'])} 檔資料抓取失敗"):
+            st.caption("；".join(R["errors"][:30]))
+    st.caption("提醒：這是用公開數字找「條件像風青」的股票，不代表一定會漲。很多股票有類似訊號最後沒漲，"
+               "請把它當成觀察名單，等下一份營收或財報證實了再考慮。本工具為個人研究用技術原型，不構成投資建議。")
+    st.stop()
+
 
 # ============================================================================
 # 頁面三：個股分析
