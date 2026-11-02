@@ -35,7 +35,7 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v2.9.1（2026-11-02）"
+APP_VERSION = "v2.9.2（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -320,9 +320,42 @@ def get_company(code: str, market: str, name: str, token: str):
     return company.us(code, " ".join(x for x in [t.get("name", ""), t.get("en", "")] if x))
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_tw_recap(token: str, favs: tuple):
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _tw_recap_cached(token: str, favs: tuple, bucket: str):
     return recap.tw(get_groups(token), token or None, list(favs))
+
+
+def tw_recap_bucket(now: dt.datetime | None = None) -> str:
+    """決定盤後資料多久重抓一次（換一個 bucket 就會重抓）。
+
+    平日 13:30～18:00：每 5 分鐘（證交所收盤行情約 14:00～14:30 公布、法人與融資約 15:00～16:30 公布）
+    其他時間：每 30 分鐘
+    """
+    now = now or live.now("TW")
+    t = now.hour * 60 + now.minute
+    if now.weekday() < 5 and 13 * 60 + 30 <= t < 18 * 60:
+        return f"{now:%Y%m%d}-{t // 5}"
+    return f"{now:%Y%m%d}-{t // 30}"
+
+
+def get_tw_recap(token: str, favs: tuple):
+    return _tw_recap_cached(token, favs, tw_recap_bucket())
+
+
+def tw_recap_note(date_str: str, now: dt.datetime | None = None) -> str:
+    """顯示的不是今天的資料時，說明原因與大概什麼時候會更新。"""
+    now = now or live.now("TW")
+    if now.weekday() >= 5 or date_str == f"{now:%Y-%m-%d}":
+        return ""
+    t = now.hour * 60 + now.minute
+    shown = f"{date_str[5:7]}/{date_str[8:]}"
+    if t < 13 * 60 + 30:
+        return f"今天還沒收盤（13:30 收盤），目前顯示的是上一個交易日 {shown} 的盤後整理。"
+    if t < 15 * 60 + 30:
+        return (f"今天（{now:%m/%d}）的收盤行情證交所大約 14:00～14:30 公布，目前先顯示 {shown}。"
+                "收盤後每 5 分鐘會自動重抓，也可以按右邊的「重新抓取」。")
+    return (f"證交所還沒有今天（{now:%m/%d}）的資料，目前顯示 {shown}。"
+            "如果今天是休市日（國定假日、颱風假），這是正常的。")
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1218,8 +1251,15 @@ if st.session_state.nav == RECAP:
             st.error(f"台股盤後資料取不到：{e}")
             tr = None
         if tr:
-            st.caption(f"交易日 {tr['date']}｜資料：證交所每日收盤行情、FinMind 三大法人與融資"
+            n1, n2 = st.columns([5, 1.3], vertical_alignment="center")
+            n1.caption(f"交易日 {tr['date']}｜資料：證交所每日收盤行情、FinMind 三大法人與融資"
                        + ("" if tr.get("has_otc") else "｜排行只含上市股票（上櫃資料尚未更新）"))
+            if n2.button("🔄 重新抓取", key="tw_recap_reload", width="stretch", help="立刻重新向證交所抓今天的盤後資料"):
+                _tw_recap_cached.clear()
+                st.rerun()
+            _note = tw_recap_note(tr["date"])
+            if _note:
+                st.info(_note)
             m = st.columns(3) + st.columns(3)
             t = tr.get("taiex")
             if t:
