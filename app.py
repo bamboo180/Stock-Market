@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.2.1（2026-11-02）"
+APP_VERSION = "v3.2.2（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -1548,9 +1548,16 @@ def radar_history():
     except Exception as e:
         st.error(f"計算失敗：{e}")
         return
-    if df.empty:
-        st.info(f"已記錄 {len(log)} 次掃描，但還抓不到後續股價（可能是今天才記錄），明天再來看。")
+    if df.empty or (df["days"] >= 1).sum() == 0:
+        n_rows = sum(len(e["rows"]) for e in log)
+        st.success(f"已記錄 {len(log)} 次掃描、共 {n_rows} 檔（最近一次：{log[-1]['date']}）。"
+                   "要等掃描日之後至少 1 個交易日收盤，才開始計算漲跌與跟大盤比較。")
+        last = log[-1]
+        st.dataframe(pd.DataFrame([{"代號": r["c"], "名稱": r["n"], "分數": r["s"], "記錄價格": r["p"],
+                                    "標記": "、".join(r.get("t", []))} for r in last["rows"]]),
+                     hide_index=True, width="stretch")
         return
+    df = df[df["days"] >= 1]                  # 掃描當天還沒有後續價格，不算進成績
     m20 = df.dropna(subset=["excess20"])
     c1, c2, c3, c4 = st.columns(4)
     metric(c1, "已追蹤", f"{len(df)} 筆", f"{len(log)} 次掃描", delta_color="off", delta_arrow="off", border=True)
@@ -1625,10 +1632,10 @@ if st.session_state.nav == RADAR:
             "做法：先用證交所／櫃買中心的「每月營收彙總表」一次篩出全市場營收在加速的公司，"
             "再對這些候選股逐檔抓 FinMind 的股價、法人、融資與季報來評分。")
     t_scan, t_hist = st.tabs(["🔍 掃描", "📈 歷史成績單"])
+    with t_scan:                 # 先掃描（會存紀錄），再畫歷史成績單，剛掃完的結果才會馬上出現
+        radar_scan_tab()
     with t_hist:
         radar_history()
-    with t_scan:
-        radar_scan_tab()
     st.stop()
 
 
