@@ -36,7 +36,22 @@ import session
 import store
 import symbols
 
-APP_VERSION = "v3.2（2026-11-02）"
+# 各程式檔需要的功能。雲端更新時如果有檔案沒上傳、或主機還留著舊版，先自動重新載入；
+# 還是舊的就清楚說明要上傳哪個檔案，而不是直接出現錯誤畫面。
+import importlib as _il
+_NEEDS = {radar: ("log_entry", "add_log", "evaluate", "factor_report", "scan"), live: ("tw_name_yahoo",),
+          store: ("RADAR_LOG_MAX", "clean_groups"), session: ("pick_chart_day",), engine: ("fetch_tw_index",)}
+_STALE = []
+for _m, _attrs in _NEEDS.items():
+    if not all(hasattr(_m, a) for a in _attrs):
+        try:
+            _il.reload(_m)
+        except Exception:
+            pass
+        if not all(hasattr(_m, a) for a in _attrs):
+            _STALE.append(_m.__name__ + ".py")
+
+APP_VERSION = "v3.2.1（2026-11-02）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -863,6 +878,9 @@ if st.session_state.nav != HOME:
 
 if st.session_state.get("store_err"):
     st.warning(st.session_state.store_err)
+if _STALE:
+    st.error(f"偵測到舊版程式檔：{'、'.join(_STALE)}。請把新版的這些檔案上傳到 GitHub（覆蓋舊檔），"
+             "再到右下角 Manage app →「⋮」→ Reboot app。")
 
 days = int(st.session_state.get("period_days", PERIODS[DEFAULT_PERIOD]))
 fetch_days = max(days, MODEL_DAYS)       # 實際抓的資料長度（模型需要）
@@ -1445,14 +1463,18 @@ def radar_scan_tab():
             st.error(f"掃描失敗：{e}")
             return
         # 每天第一次掃描自動存進「歷史成績單」，之後才能對答案
-        _entry = radar.log_entry(R, r_market, int(r_n), f"{dt.date.today():%Y-%m-%d}")
-        _new, _added = radar.add_log(st.session_state.get("radar_log", []), _entry, store.RADAR_LOG_MAX)
-        if _added:
-            _keep = st.session_state.get("manage_open")
-            st.session_state.radar_log = _new
-            save_favs()
-            st.session_state.manage_open = _keep
-            st.toast(f"已把今天的 {len(_entry['rows'])} 檔記錄到「歷史成績單」")
+        try:                                    # 記錄失敗也不影響掃描結果的顯示
+            _entry = radar.log_entry(R, r_market, int(r_n), f"{dt.date.today():%Y-%m-%d}")
+            _new, _added = radar.add_log(st.session_state.get("radar_log", []), _entry,
+                                         getattr(store, "RADAR_LOG_MAX", 120))
+            if _added:
+                _keep = st.session_state.get("manage_open")
+                st.session_state.radar_log = _new
+                save_favs()
+                st.session_state.manage_open = _keep
+                st.toast(f"已把今天的 {len(_entry['rows'])} 檔記錄到「歷史成績單」")
+        except Exception as _e:
+            st.caption(f"（這次沒有記錄到歷史成績單：{_e}）")
         rows = [x for x in R["rows"] if x["score"] >= r_min and (r_hot or "已大漲" not in x["tags"])
                 and (not r_small or "大型股" not in x.get("tags", []))]
         st.caption(f"營收資料：{radar.ym_text(R['ym'])}｜全市場 {R['n_all']} 家 → 營收加速候選 {R['n_cand']} 家 → "
