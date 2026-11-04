@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.2.3（2026-11-02）"
+APP_VERSION = "v3.2.4（2026-11-04）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -1751,7 +1751,7 @@ c1, c2, c3, c4, c5 = st.columns([1, 1.3, 1.2, 1, 1])
 chg_c = up_c if r["chg"] > 0 else down_c if r["chg"] < 0 else "gray"
 card(c1, "收盤價（分析基準）", f"{r['close']:,.2f}",
      f"{r['close'] - r['close'] / (1 + r['chg']):+,.2f}（{r['chg'] * 100:+.2f}%）{cur}", sub_color=chg_c)
-def prob_card(col, title, h):
+def prob_card(col, title, h, days: int = 1):
     if not h:
         card(col, title, "—", "資料不足")
         return
@@ -1764,7 +1764,18 @@ def prob_card(col, title, h):
         f"<div style='display:flex;height:6px;border-radius:3px;overflow:hidden;margin:4px 0'>"
         f"<div style='width:{pu * 100:.0f}%;background:{up_c}'></div>"
         f"<div style='width:{(1 - pu) * 100:.0f}%;background:{down_c}'></div></div>"
-        f"<div class='sub'>起點 {h['base'] * 100:.0f}%，依下方機率表加減</div></div>", unsafe_allow_html=True)
+        f"<div class='sub'>{horizon_text(days)}<br>歷史平均 {h['base'] * 100:.0f}%，各因素加減後 {pu * 100:.0f}%</div></div>",
+        unsafe_allow_html=True)
+
+
+def horizon_text(days: int) -> str:
+    """說清楚「跟哪一天的收盤價比、比到哪一天」。結束日以平日推算，沒扣國定假日，所以寫「約」。"""
+    try:
+        d0 = pd.Timestamp(str(r["asof"])[:10])
+        d1 = pd.bdate_range(d0, periods=days + 1)[-1]
+        return f"{d0:%m/%d} 收盤 {r['close']:,.2f} → {'約 ' if days > 1 else ''}{d1:%m/%d} 收盤"
+    except Exception:
+        return "跟分析基準的收盤價比"
 
 
 prob_card(c2, "下一個交易日", P["next"] if P else None)
@@ -1773,7 +1784,7 @@ card(c3, "10 日預估區間（80%）",
      f"<span style='color:{down_c}'>{d['p10'] * 100:+.1f}%</span> ~ <span style='color:{up_c}'>{d['p90'] * 100:+.1f}%</span>",
      f"中位數 {d['p50'] * 100:+.1f}%")
 card(c4, "停損參考", f"{r['stop']:,.2f}", f"跌破代表超出悲觀預估（{d['p10'] * 100:+.1f}%）")
-prob_card(c5, "未來 10 個交易日", P["h10"] if P else None)
+prob_card(c5, "未來 10 個交易日", P["h10"] if P else None, 10)
 
 if P and P["next"].get("gap_mu") is not None:
     g = P["next"]
