@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.2.4（2026-11-04）"
+APP_VERSION = "v3.2.5（2026-11-05）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -114,6 +114,13 @@ st.markdown("""
 .live .row{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:baseline}
 .live .px{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums}
 [data-testid="InputInstructions"]{display:none!important}
+/* 重跑時不要把整頁調淡（看起來像當掉）：舊內容照常顯示，新內容出來直接換掉；
+   改在最上方顯示一條細細的跑馬燈代表「更新中」 */
+[data-stale="true"]{opacity:1!important;filter:none!important;transition:none!important}
+.stApp[data-test-script-state="running"]::before{content:"";position:fixed;top:0;left:0;right:0;height:3px;z-index:1000000;
+  background:linear-gradient(90deg,rgba(47,91,211,0),#2f5bd3,rgba(47,91,211,0));background-size:35% 100%;
+  background-repeat:no-repeat;animation:runbar 1.1s linear infinite}
+@keyframes runbar{from{background-position:-35% 0}to{background-position:135% 0}}
 /* 左側欄最愛：條列式，每列蓋一顆透明按鈕，整列都可以點 */
 [class*="st-key-srow_"]{position:relative;gap:0}
 [class*="st-key-srow_"] [class*="st-key-fav_"]{position:absolute!important;inset:0;z-index:2;margin:0;width:100%!important}
@@ -697,10 +704,14 @@ def side_fav_list():
     if not codes:
         st.caption("這個群組還沒有股票。")
         return
-    try:                                                     # 報價最多等 2 秒，等不到先顯示名稱
-        q = bg(get_quotes, tuple(codes)).result(timeout=2)
+    # 報價不擋畫面：先用上一次的報價，新報價在背景抓（最多等 0.3 秒，等不到下次重跑就會是新的）
+    q = dict(st.session_state.get("_side_quotes", {}))
+    try:
+        fresh = bg(get_quotes, tuple(codes)).result(timeout=0.3 if q else 1.5)
+        q.update(fresh)
+        st.session_state._side_quotes = q
     except Exception:
-        q = {}
+        pass
     active = st.session_state.code if st.session_state.nav == STOCK else None
     # 超過 8 檔時清單放在固定高度的框裡，框內自己捲動，側邊欄不會越拉越長
     many = len(codes) > 8
