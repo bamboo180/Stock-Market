@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.2.5（2026-11-05）"
+APP_VERSION = "v3.2.6（2026-11-12）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -449,6 +449,7 @@ def get_quotes(codes: tuple[str, ...]) -> dict:
 # 我的最愛
 # ----------------------------------------------------------------------------
 fav_store = store.make_store(secret("GITHUB_TOKEN"), secret("GITHUB_REPO"))
+ON_CLOUD = os.path.abspath(__file__).startswith("/mount/src")      # Streamlit 雲端的程式放在 /mount/src
 if "favs" not in st.session_state:
     try:
         _data = fav_store.load()
@@ -869,6 +870,31 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     st.caption(f"最愛儲存於：{fav_store.label}")
+    if ON_CLOUD and "本機" in fav_store.label:
+        st.warning("目前放在 Streamlit 雲端，但最愛存在暫存檔：主機重開、休眠或更新程式時就會被清掉。"
+                   "請照 README 設定 GitHub 儲存，或先用下面的「備份／還原」下載一份。")
+    with st.popover("💾 備份／還原最愛", width="stretch"):
+        st.caption("備份檔包含：群組與最愛、持倉成本、首頁指數、潛力股雷達的歷史成績單。")
+        _backup = {"favorites": st.session_state.favs, "groups": st.session_state.groups,
+                   "positions": st.session_state.positions, "indices": st.session_state.indices,
+                   "radar_log": st.session_state.get("radar_log", [])}
+        st.download_button("⬇ 下載備份檔", json.dumps(_backup, ensure_ascii=False, indent=1),
+                           file_name=f"stock_favorites_{dt.date.today():%Y%m%d}.json", mime="application/json",
+                           width="stretch")
+        _up = st.file_uploader("上傳備份檔還原", type=["json"], key="restore_file")
+        if _up is not None and st.button("確認還原（會取代目前的最愛）", type="primary", width="stretch"):
+            try:
+                _d = store._normalize(json.loads(_up.getvalue().decode("utf-8")))
+                st.session_state.groups = _d["groups"]
+                st.session_state.positions = _d["positions"]
+                st.session_state.indices = _d["indices"]
+                st.session_state.radar_log = _d.get("radar_log", [])
+                save_favs()
+                st.session_state.manage_open = False
+                st.toast(f"已還原 {len(st.session_state.favs)} 檔最愛、{len(st.session_state.groups)} 個群組")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"這個檔案沒辦法還原：{_e}")
     st.caption("歷史資料每 30 分鐘更新；開盤時報價每 60 秒自動更新。")
     st.caption(f"版本 {APP_VERSION}")
 

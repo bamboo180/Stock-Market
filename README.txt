@@ -168,6 +168,8 @@ requirements.txt  需要的套件
      GITHUB_REPO = "你的GitHub帳號/stock-signal-app"
 5. 側邊欄底部會顯示「最愛儲存於：GitHub」
 最愛會存在 repo 的 favorites-data 分支，不會影響程式碼，也不會觸發重新部署。
+沒設定 GitHub 儲存時，雲端版的最愛只存在暫存檔：主機休眠、重開（Reboot）或你更新程式時都會被清掉。
+左側欄最下面「💾 備份／還原最愛」可以下載備份檔（含群組、持倉、首頁指數、雷達歷史成績單），之後上傳就能還原。
 
 【AI 新聞摘要（選用，需付費）】
 在 secrets.toml（雲端則是 Secrets）加上 Anthropic API key：
