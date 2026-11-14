@@ -1,0 +1,31 @@
+{
+ "favorites": [
+  "2330",
+  "0050",
+  "AAPL",
+  "NVDA",
+  "0056"
+ ],
+ "groups": [
+  {
+   "name": "我的最愛",
+   "codes": [
+    "2330",
+    "0050",
+    "AAPL",
+    "NVDA",
+    "0056"
+   ]
+  }
+ ],
+ "radar_log": [],
+ "indices": [
+  "^TWII",
+  "^TWOII",
+  "^GSPC",
+  "^IXIC",
+  "^DJI",
+  "^SOX"
+ ],
+ "positions": {}
+}
