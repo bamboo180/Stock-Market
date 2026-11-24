@@ -19,9 +19,13 @@
   }
  ],
  "radar_log": [],
+ "flags": {
+  "txf": true
+ },
  "indices": [
   "^TWII",
   "^TWOII",
+  "TXF=F",
   "^GSPC",
   "^IXIC",
   "^DJI",
