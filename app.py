@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.3（2026-11-24）"
+APP_VERSION = "v3.4（2026-11-24）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -303,8 +303,8 @@ def analyze(code: str, days: int, token: str | None):
 @st.cache_data(ttl=900, show_spinner=False)
 def get_news(code: str, market: str, name: str):
     if market == "IDX":
-        q = {"^TWII": "台股 加權指數", "^TWOII": "櫃買指數 上櫃"}.get(code, f"{name or code}")
-        lang = "zh" if code in ("^TWII", "^TWOII") or not name.isascii() else "en"
+        q = {"^TWII": "台股 加權指數", "^TWOII": "櫃買指數 上櫃", "TXF=F": "台指期 外資 期貨"}.get(code, f"{name or code}")
+        lang = "zh" if code in ("^TWII", "^TWOII", "TXF=F") or not name.isascii() else "en"
         return news._dedupe(news._google(f"{q} when:3d", lang))[:30]
     return news.fetch(code, market, name)
 
@@ -468,6 +468,14 @@ if "favs" not in st.session_state:
     st.session_state.positions = _data["positions"]
     st.session_state.indices = _data.get("indices", list(store.DEFAULT_INDICES))
     st.session_state.radar_log = _data.get("radar_log", [])
+    st.session_state.store_flags = dict(_data.get("flags", {}))
+    # 一次性：新版加入「台指期近全」，舊的指數清單自動補上（之後使用者移除就不會再加回來）
+    if not st.session_state.store_flags.get("txf"):
+        _ix = st.session_state.indices
+        if "TXF=F" not in _ix:
+            _ix.insert(_ix.index("^TWOII") + 1 if "^TWOII" in _ix else min(2, len(_ix)), "TXF=F")
+        st.session_state.store_flags["txf"] = True
+        st.session_state._need_save = True
 
 
 def save_favs():
@@ -478,7 +486,8 @@ def save_favs():
     try:
         fav_store.save({"favorites": st.session_state.favs, "groups": st.session_state.groups,
                         "positions": st.session_state.positions, "indices": st.session_state.indices,
-                        "radar_log": st.session_state.get("radar_log", [])})
+                        "radar_log": st.session_state.get("radar_log", []),
+                        "flags": st.session_state.get("store_flags", {})})
         st.session_state.pop("store_err", None)
     except store.StoreError as e:
         st.session_state.store_err = str(e) + "（這次的變更只在目前畫面有效）"
@@ -595,6 +604,12 @@ def group_delete(name: str):
     if st.session_state.get("fav_view") == name:
         st.session_state.fav_view = "全部"
     save_favs()
+
+
+if st.session_state.pop("_need_save", False):        # 一次性的資料更新（例如補上台指期）要存起來
+    _keep_m = st.session_state.get("manage_open")
+    save_favs()
+    st.session_state.manage_open = _keep_m
 
 
 def toggle_fav(code: str):
@@ -2280,7 +2295,34 @@ with tab_k:
 
 show = max(N_VIEW, 20)
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_fut_inst(token: str, start: str) -> pd.DataFrame:
+    import futures
+    return futures.institutional(start, token or None)
+
+
 with tab_chip:
+    if code == "TXF=F":
+        st.markdown("#### 台指期三大法人淨未平倉（口）")
+        st.caption("多單減空單，正數偏多、負數偏空。外資的淨空單常被拿來當作避險或看空的指標；投信的多單多半是替 ETF 避險。")
+        try:
+            fi = get_fut_inst(token or "", (dt.date.today() - dt.timedelta(days=max(days, 120))).isoformat())
+        except Exception as e:
+            fi = pd.DataFrame()
+            st.warning(f"抓不到期貨法人資料：{e}")
+        if len(fi):
+            figf = go.Figure()
+            for nm, colr in (("外資", "#2f5bd3"), ("投信", "#d1352b"), ("自營商", "#8a8d95")):
+                if nm in fi:
+                    figf.add_trace(go.Scatter(x=fi["date"], y=fi[nm], name=nm, line=dict(color=colr, width=2)))
+            figf.add_hline(y=0, line_color="gray", line_dash="dot")
+            figf.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10),
+                               legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0))
+            st.plotly_chart(figf, width="stretch", key="fut_inst")
+            last, prev = fi.iloc[-1], fi.iloc[-2] if len(fi) > 1 else fi.iloc[-1]
+            st.markdown("　".join(f"**{nm}** {last[nm]:+,.0f} 口（較前一日 {last[nm] - prev[nm]:+,.0f}）"
+                                 for nm in ("外資", "投信", "自營商") if nm in fi))
+        st.divider()
     ch = r["chips"].tail(show)
     series = [c for c in ch.columns if c != "date"]
     if market == "TW":

@@ -11,6 +11,7 @@ import live
 CATALOG: dict[str, tuple[str, str, str | None]] = {
     "^TWII": ("加權指數", "TW", "tse_t00.tw"),
     "^TWOII": ("櫃買指數", "TW", "otc_o00.tw"),
+    "TXF=F": ("台指期近全", "TW", None),
     "^GSPC": ("S&P 500", "US", None),
     "^IXIC": ("那斯達克", "US", None),
     "^DJI": ("道瓊工業", "US", None),
@@ -33,7 +34,7 @@ CATALOG: dict[str, tuple[str, str, str | None]] = {
     "BTC-USD": ("比特幣", "加密", None),
 }
 _TW_CACHE: dict = {}
-DEFAULT = ["^TWII", "^TWOII", "^GSPC", "^IXIC", "^DJI", "^SOX"]
+DEFAULT = ["^TWII", "^TWOII", "TXF=F", "^GSPC", "^IXIC", "^DJI", "^SOX"]
 
 
 def name_of(sym: str) -> str:
@@ -84,6 +85,38 @@ def fetch(symbols: list[str], spark_days: int = 22, token: str | None = None) ->
                           "source": "FinMind／櫃買中心"}
             except Exception:
                 pass
+
+    # 台指期近全：走勢用 FinMind 日 K（30 分鐘抓一次），價格用期交所即時（夜盤也有）
+    if "TXF=F" in symbols:
+        try:
+            import futures
+            hit = _TW_CACHE.get("TXF=F")
+            if hit and time.time() - hit[0] < 1800:
+                df = hit[1]
+            else:
+                df = futures.history((pd.Timestamp.today() - pd.Timedelta(days=60)).strftime("%Y-%m-%d"), token)
+                _TW_CACHE["TXF=F"] = (time.time(), df)
+            close = df.set_index("date")["close"]
+            out["TXF=F"] = {"price": float(close.iloc[-1]), "prev": float(close.iloc[-2]),
+                            "spark": [round(float(x), 2) for x in close.tail(spark_days)],
+                            "date": close.index[-1].strftime("%Y%m%d"), "time": close.index[-1].strftime("%m/%d"),
+                            "source": "FinMind"}
+        except Exception:
+            pass
+        try:
+            import futures
+            q = futures.realtime()
+            if q and q.get("price"):
+                d = out.setdefault("TXF=F", {"spark": [], "date": ""})
+                if d["spark"]:
+                    if d["date"] and q["date"] > d["date"]:
+                        d["spark"] = (d["spark"] + [round(q["price"], 2)])[-spark_days:]
+                    else:
+                        d["spark"][-1] = round(q["price"], 2)
+                d.update({"price": q["price"], "prev": q["prev"] or d.get("prev"), "date": q["date"],
+                          "time": q["time"], "source": q["source"]})
+        except Exception:
+            pass
 
     # 台股指數：用證交所即時值（盤中約 5 秒延遲，收盤後為當日收盤）
     tw = {CATALOG[s][2]: s for s in symbols if s in CATALOG and CATALOG[s][2]}

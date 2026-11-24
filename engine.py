@@ -350,6 +350,12 @@ def fetch_tw_index(symbol: str, start: str, token: str | None = None) -> pd.Data
 def fetch_index(symbol: str, start: str, token: str | None = None) -> pd.DataFrame:
     if symbol in ("^TWII", "^TWOII"):
         df = fetch_tw_index(symbol, start, token)
+    elif symbol == "TXF=F":                  # 台指期近全（FinMind 期貨日資料，夜盤＋日盤合成）
+        import futures
+        try:
+            df = futures.history(start, token)
+        except Exception as e:
+            raise DataError(f"抓不到台指期資料：{e}")
     else:
         df = _yf(symbol, start)
     if df.empty:

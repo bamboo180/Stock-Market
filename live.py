@@ -18,7 +18,7 @@ MIS_INDEX = {"^TWII": "tse_t00.tw", "^TWOII": "otc_o00.tw"}      # 台股指數�
 
 def session_of(code: str, market: str) -> str:
     """決定用哪個市場的交易時段：台股、台股指數用 TW，其他用 US。"""
-    return "TW" if market == "TW" or code in MIS_INDEX else "US"
+    return "TW" if market == "TW" or code in MIS_INDEX or code == "TXF=F" else "US"
 
 
 # ----------------------------------------------------------------------------
@@ -125,8 +125,16 @@ def _safe(fi, attr):
 def quotes(codes: list[str], market_of) -> dict[str, dict]:
     tw = [c for c in codes if market_of(c) == "TW"]
     tw_idx = [c for c in codes if c in MIS_INDEX]
-    us = [c for c in codes if market_of(c) in ("US", "IDX") and c not in MIS_INDEX]
+    us = [c for c in codes if market_of(c) in ("US", "IDX") and c not in MIS_INDEX and c != "TXF=F"]
     out = quotes_tw(tw)
+    if "TXF=F" in codes:                      # 台指期近全：期交所即時（日盤／夜盤）
+        try:
+            import futures
+            q = futures.realtime()
+            if q:
+                out["TXF=F"] = q
+        except Exception:
+            pass
     if tw_idx:
         q = quotes_mis([MIS_INDEX[c] for c in tw_idx])
         for c in tw_idx:

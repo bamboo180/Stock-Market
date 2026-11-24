@@ -70,7 +70,8 @@ def _normalize(data) -> dict:
     log = data.get("radar_log")
     log = [x for x in log if isinstance(x, dict) and x.get("date") and x.get("rows")][-RADAR_LOG_MAX:] \
         if isinstance(log, list) else []
-    return {"favorites": flatten(groups), "groups": groups, "radar_log": log,
+    flags = data.get("flags") if isinstance(data.get("flags"), dict) else {}
+    return {"favorites": flatten(groups), "groups": groups, "radar_log": log, "flags": flags,
             "indices": _clean(DEFAULT_INDICES if idx is None else idx),
             "positions": {str(k).upper(): v for k, v in pos.items() if isinstance(v, dict) and v.get("cost")}}
 
