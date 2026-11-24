@@ -51,7 +51,7 @@ for _m, _attrs in _NEEDS.items():
         if not all(hasattr(_m, a) for a in _attrs):
             _STALE.append(_m.__name__ + ".py")
 
-APP_VERSION = "v3.2.6（2026-11-12）"
+APP_VERSION = "v3.3（2026-11-24）"
 st.set_page_config(page_title="股票訊號看板", page_icon="📈", layout="wide")
 # 背景執行緒呼叫快取函式時 Streamlit 會印「missing ScriptRunContext」，不影響功能，關掉這個訊息
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -433,6 +433,12 @@ def kv_html(rows) -> str:
                    f"<span class='small' style='min-width:6.5em'>{k}</span>"
                    f"<span style='word-break:break-all'>{val}</span></div>")
     return "".join(out)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_kbars(code: str, market: str) -> dict:
+    """K 線圖的 1／5／60 分線（Yahoo）。"""
+    return kchart.intraday_sets(code, market)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1692,6 +1698,7 @@ F_PROB = bg(get_prob, code, fetch_days, token)
 F_CO = bg(get_company, code, _mk, news_name(code), token or "") if _mk in ("TW", "US") else None
 F_Q = bg(get_quotes, (code,))
 F_INTRA = bg(get_intraday, code, _mk) if _mk != "IDX" or code in ("^TWII", "^GSPC", "^IXIC", "^DJI", "^SOX") else None
+F_KBARS = bg(get_kbars, code, _mk)
 IDX_REF = {"TW": "^TWII", "US": "^GSPC"}.get(_mk)
 F_IDXQ = bg(get_quotes, (IDX_REF,)) if IDX_REF else None
 try:
@@ -2261,11 +2268,15 @@ with tab_k:
         if qd is not None and qd > last["date"] and (SESSION == "TW" or live.is_open(SESSION)):
             today = {"date": qd.strftime("%Y-%m-%d"), "open": q["open"], "high": q["high"],
                      "low": q["low"], "close": q["price"]}
+    kb = wait(F_KBARS, {}, timeout=6) or {}            # 分線抓不到也不影響日／週／月線
+    _src = "日線：" + ("FinMind" if market == "TW" else "Yahoo") + ("　分線：Yahoo（約延遲 20 分鐘）" if kb else "")
     embed_html(kchart.build(df, r["cone"], up_c, down_c, STOP_REF, stop_label=STOP_LABEL, today=today, dark=is_dark(),
-                                 cost=(st.session_state.positions.get(code) or {}).get("cost"), view=N_VIEW,
-                                 vol_unit={"TW": "張", "US": "股"}.get(market, "")), height=600)
-    st.caption("藍色帶狀是未來 20 個交易日的 80% 機率區間（依近 60 日波動度估計），不是預言的走勢；"
-               "虛線是停損參考；空心 K 棒是今天盤中暫定值，收盤資料更新後才納入評分。")
+                            cost=(st.session_state.positions.get(code) or {}).get("cost"), view=N_VIEW,
+                            vol_unit={"TW": "張", "US": "股"}.get(market, ""), intra=kb,
+                            name=f"{code} {name}".strip(), key=code, source=_src), height=640)
+    st.caption("上方切換 1分～月線；左側是畫線工具（畫完自動回到游標，雙擊某條線可刪除，Ctrl+Z 復原），畫的線會記在這台裝置的瀏覽器。"
+               "藍色帶狀是未來 20 個交易日的 80% 機率區間（只在日線顯示），不是預言的走勢；空心 K 棒是今天盤中暫定值。"
+               "右上「指標」可以開關均線、成交量、預估區間與停損線。")
 
 show = max(N_VIEW, 20)
 
